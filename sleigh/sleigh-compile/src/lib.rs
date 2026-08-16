@@ -241,6 +241,7 @@ pub(crate) struct Context {
     has_alignment: bool,
     has_register_space: bool,
     has_ram_space: bool,
+    has_ram2_space: bool,
 
     verbose: bool,
     capture_debug_info: bool,
@@ -294,7 +295,12 @@ fn resolve_item(ctx: &mut Context, syms: &mut SymbolTable, item: ast::Item) -> R
                 }
 
                 ast::SpaceKind::RamSpace => {
-                    check_not_defined!(ctx.has_ram_space, "multiple ram spaces not supported");
+                    // The first RAM space maps to RAM_SPACE; a second maps to
+                    // RAM2_SPACE. A third is rejected.
+                    if ctx.has_ram_space {
+                        check_not_defined!(ctx.has_ram2_space, "multiple ram spaces not supported");
+                    }
+                    ctx.has_ram_space = true;
                     syms.define_space(space)?;
                 }
                 ast::SpaceKind::RomSpace => return Err("rom space not implemented".into()),

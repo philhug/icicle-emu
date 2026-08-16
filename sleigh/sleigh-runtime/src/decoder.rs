@@ -321,7 +321,7 @@ impl Decoder {
 
             // Only Values or RamRefs are valid for globalset subtable results
             let val = match subtable_info.export.as_ref()? {
-                Export::Value(val) | Export::RamRef(val, _) => val,
+                Export::Value(val) | Export::RamRef(val, _) | Export::Ram2Ref(val, _) => val,
                 Export::RegisterRef(_, _) => return None,
             };
             let crate::semantics::Local::Field(idx) = val.local else {

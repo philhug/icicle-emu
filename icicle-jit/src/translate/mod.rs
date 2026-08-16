@@ -881,6 +881,10 @@ impl<'a> Translator<'a> {
                         // so we defer this to the interpreter.
                         ctx.trans.interpret(ctx.instruction);
                     }
+                    pcode::RAM2_SPACE => {
+                        // Secondary RAM space (e.g. RISC-V CSRs); defer to the interpreter.
+                        ctx.trans.interpret(ctx.instruction);
+                    }
                     pcode::RESERVED_SPACE_END.. => {
                         if !is_jit_supported_size(output.size) {
                             ctx.trans.interpret(ctx.instruction);
@@ -902,6 +906,10 @@ impl<'a> Translator<'a> {
                     pcode::REGISTER_SPACE => {
                         // The target register needs to be resolved dynamically using SLEIGH data,
                         // so we defer this to the interpreter.
+                        ctx.trans.interpret(ctx.instruction);
+                    }
+                    pcode::RAM2_SPACE => {
+                        // Secondary RAM space (e.g. RISC-V CSRs); defer to the interpreter.
                         ctx.trans.interpret(ctx.instruction);
                     }
                     pcode::RESERVED_SPACE_END.. => {

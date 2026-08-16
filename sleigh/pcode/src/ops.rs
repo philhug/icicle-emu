@@ -32,8 +32,11 @@ pub const RAM_SPACE: MemId = 0;
 /// The memory ID associated with the register space.
 pub const REGISTER_SPACE: MemId = 1;
 
+/// The memory ID associated with a second RAM space (e.g. the RISC-V CSR space).
+pub const RAM2_SPACE: MemId = 2;
+
 /// The memory ID after all reserved spaces.
-pub const RESERVED_SPACE_END: MemId = 2;
+pub const RESERVED_SPACE_END: MemId = 3;
 
 /// Represents a reference to a slice of a P-code variable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

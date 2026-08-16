@@ -25,6 +25,8 @@ enum ExprValue {
     BinOp(pcode::Op, (Value, Value)),
     /// A reference to location in memory.
     RamRef(Value, ValueSize),
+    /// A reference to a location in a secondary RAM space (e.g. RISC-V CSRs).
+    Ram2Ref(Value, ValueSize),
     /// A reference to a dynamically computed register.
     RegisterRef(Value, ValueSize),
     /// Represents the address of a place (either a memory location, or a register).
@@ -95,6 +97,7 @@ pub(crate) fn resolve(
         match &mut export {
             Export::Value(value) => *value = builder.fix_size(*value),
             Export::RamRef(value, _) => *value = builder.fix_size(*value),
+            Export::Ram2Ref(value, _) => *value = builder.fix_size(*value),
             Export::RegisterRef(value, _) => *value = builder.fix_size(*value),
         }
         builder.semantics.export = Some(export);
@@ -163,6 +166,8 @@ impl Semantics {
 enum Destination {
     Local(Value),
     RamRef(Value, ValueSize),
+    Ram2Ref(Value, ValueSize),
+    Ram2RefSlice(Value, ValueSize, ast::Range),
     BitRange(Value, ast::Range),
 }
 
@@ -377,6 +382,20 @@ impl<'a, 'b> Builder<'a, 'b> {
     }
 
     fn load(&mut self, size: ValueSize, ptr: Value, output: Option<Value>) -> Value {
+        self.load_at(pcode::RAM_SPACE, size, ptr, output)
+    }
+
+    fn load2(&mut self, size: ValueSize, ptr: Value, output: Option<Value>) -> Value {
+        self.load_at(pcode::RAM2_SPACE, size, ptr, output)
+    }
+
+    fn load_at(
+        &mut self,
+        space: pcode::MemId,
+        size: ValueSize,
+        ptr: Value,
+        output: Option<Value>,
+    ) -> Value {
         let mut output = output.unwrap_or_else(|| self.scope.add_tmp(None).into());
         if size != 0 {
             // Note: we force the size here, to workaround the sizes used for the
@@ -389,10 +408,18 @@ impl<'a, 'b> Builder<'a, 'b> {
             }
             self.set_size(&mut output, size);
         }
-        self.op(pcode::Op::Load(pcode::RAM_SPACE), &[ptr], Some(output))
+        self.op(pcode::Op::Load(space), &[ptr], Some(output))
     }
 
-    fn store(&mut self, size: ValueSize, ptr: Value, mut value: Value) {
+    fn store(&mut self, size: ValueSize, ptr: Value, value: Value) {
+        self.store_at(pcode::RAM_SPACE, size, ptr, value)
+    }
+
+    fn store2(&mut self, size: ValueSize, ptr: Value, value: Value) {
+        self.store_at(pcode::RAM2_SPACE, size, ptr, value)
+    }
+
+    fn store_at(&mut self, space: pcode::MemId, size: ValueSize, ptr: Value, mut value: Value) {
         if size != 0 {
             // See note for `load`
             if self.size_of(value).is_some() {
@@ -400,7 +427,7 @@ impl<'a, 'b> Builder<'a, 'b> {
             }
             self.set_size(&mut value, size);
         }
-        self.op_no_output(pcode::Op::Store(pcode::RAM_SPACE), &[ptr, value]);
+        self.op_no_output(pcode::Op::Store(space), &[ptr, value]);
     }
 
     fn unimplemented(&mut self) {
@@ -557,6 +584,7 @@ impl<'a, 'b> Builder<'a, 'b> {
             ast::Statement::Export { value } => {
                 let export = match self.resolve_expr(value)? {
                     ExprValue::RamRef(value, size) => Export::RamRef(value, size),
+                    ExprValue::Ram2Ref(value, size) => Export::Ram2Ref(value, size),
                     ExprValue::RegisterRef(value, size) => Export::RegisterRef(value, size),
                     value => Export::Value(self.read_value(value, None)?),
                 };
@@ -587,6 +615,28 @@ impl<'a, 'b> Builder<'a, 'b> {
                     Destination::RamRef(ptr, size) => {
                         let tmp = self.read_value(value, None)?;
                         self.store(size, ptr, tmp);
+                    }
+                    Destination::Ram2Ref(ptr, size) => {
+                        let tmp = self.read_value(value, None)?;
+                        self.store2(size, ptr, tmp);
+                    }
+                    Destination::Ram2RefSlice(ptr, size, (bit_offset, num_bits)) => {
+                        // Read-modify-write on a secondary RAM location (e.g. a RISC-V CSR):
+                        // load, patch the bit range, store back.
+                        let current = self.load2(size, ptr, None);
+                        let value = self.read_value(value, None)?;
+                        let mask_bits = pcode::mask(num_bits as u64);
+                        let mask = Value::constant(!(mask_bits << bit_offset));
+                        let prev = self.scope.add_tmp(self.size_of(current)).into();
+                        self.op(pcode::Op::IntAnd, &[current, mask], Some(prev));
+                        let mask = Value::constant(mask_bits);
+                        let shift = Value::constant(bit_offset as u64);
+                        let tmp = self.scope.add_tmp(self.size_of(current)).into();
+                        self.op(pcode::Op::ZeroExtend, &[value], Some(tmp));
+                        self.op(pcode::Op::IntAnd, &[tmp, mask], Some(tmp));
+                        self.op(pcode::Op::IntLeft, &[tmp, shift], Some(tmp));
+                        self.op(pcode::Op::IntOr, &[prev, tmp], Some(current));
+                        self.store2(size, ptr, current);
                     }
                     Destination::BitRange(dst, (bit_offset, num_bits)) => {
                         if let Some(dst) = try_slice_bits(dst, (bit_offset, num_bits)) {
@@ -620,6 +670,7 @@ impl<'a, 'b> Builder<'a, 'b> {
                 let mut value = self.resolve_expr_value(value)?;
                 match self.resolve_address(space, *size, pointer)? {
                     ExprValue::RamRef(ptr, size) => self.store(size, ptr, value),
+                    ExprValue::Ram2Ref(ptr, size) => self.store2(size, ptr, value),
                     ExprValue::RegisterRef(pointer, size) => {
                         if size != 0 {
                             self.set_size(&mut value, size)
@@ -944,12 +995,20 @@ impl<'a, 'b> Builder<'a, 'b> {
                     }
                 }
             }
+            ast::PcodeExpr::SliceBits { value, range } => {
+                // A bit-slice of a secondary RAM location (e.g. a RISC-V CSR field)
+                // used as a write destination requires a read-modify-write.
+                if let Ok(ExprValue::Ram2Ref(ptr, size)) = self.resolve_expr(value) {
+                    return Ok(Destination::Ram2RefSlice(ptr, size, *range));
+                }
+            }
             _ => {}
         };
 
         match self.resolve_expr(expr)? {
             ExprValue::Local(value) => Ok(Destination::Local(value)),
             ExprValue::RamRef(pointer, size) => Ok(Destination::RamRef(pointer, size)),
+            ExprValue::Ram2Ref(pointer, size) => Ok(Destination::Ram2Ref(pointer, size)),
             ExprValue::BitRange(value, range) => Ok(Destination::BitRange(value, range)),
             _ => Err(format!("cannot assign to expression: {expr:?}")),
         }
@@ -981,6 +1040,7 @@ impl<'a, 'b> Builder<'a, 'b> {
                 output
             }
             ExprValue::RamRef(pointer, size) => self.load(size, pointer, out),
+            ExprValue::Ram2Ref(pointer, size) => self.load2(size, pointer, out),
             ExprValue::RegisterRef(pointer, size) => {
                 let mut output = out.unwrap_or_else(|| self.scope.add_tmp(Some(size)).into());
                 if size != 0 {
@@ -1030,7 +1090,16 @@ impl<'a, 'b> Builder<'a, 'b> {
         // A subset of globals are also allowed inside the constructor
         let global = self.scope.globals.lookup(ident)?;
         match global.kind {
-            SymbolKind::Register => Ok(Local::Register(global.id).into()),
+            SymbolKind::Register => {
+                let reg = &self.scope.globals.registers[global.id as usize];
+                if reg.space_id == pcode::RAM2_SPACE {
+                    // A named register in a secondary RAM space (e.g. a RISC-V CSR)
+                    // is addressed by its byte offset in that space.
+                    Ok(ExprValue::Ram2Ref(Value::constant(reg.offset as u64), reg.size))
+                } else {
+                    Ok(Local::Register(global.id).into())
+                }
+            }
             SymbolKind::BitRange => {
                 let symbol = &self.scope.globals.bit_ranges[global.id as usize];
                 let source = Value::from(Local::Register(symbol.register));
@@ -1076,12 +1145,40 @@ impl<'a, 'b> Builder<'a, 'b> {
             };
         }
 
-        let (space_id, _addr_size, _word_size) = self.resolve_space(space)?;
-        let pointer = self.read_value(pointer, None)?;
+        // When dereferencing a subtable that exports a memory reference in a
+        // non-default space (e.g. a RISC-V `csr` exporting `*[csreg]`), use that
+        // space and do not apply word-size scaling: the subtable's export is
+        // already a byte offset into the space.
+        if space.is_none() {
+            if let ExprValue::Local(Value { local: Local::Subtable(idx), .. }) = &pointer {
+                let table_id = self.scope.subtables[*idx as usize];
+                if let Some(export_space) =
+                    self.scope.globals.tables[table_id as usize].export_space
+                {
+                    let ptr = self.read_value(pointer, None)?;
+                    return Ok(match export_space {
+                        pcode::RAM_SPACE => ExprValue::RamRef(ptr, size.unwrap_or(0)),
+                        pcode::RAM2_SPACE => ExprValue::Ram2Ref(ptr, size.unwrap_or(0)),
+                        _ => ExprValue::RamRef(ptr, size.unwrap_or(0)),
+                    });
+                }
+            }
+        }
+
+        let (space_id, _addr_size, word_size) = self.resolve_space(space)?;
+        let mut pointer = self.read_value(pointer, None)?;
+
+        // A RAM space with a word size > 1 addresses words, so scale the pointer
+        // to a byte offset (e.g. RISC-V `csreg` has wordsize == XLEN).
+        if word_size > 1 && matches!(space_id, pcode::RAM_SPACE | pcode::RAM2_SPACE) {
+            let ws = Value::constant(word_size as u64);
+            pointer = self.op(pcode::Op::IntMul, &[pointer, ws], None);
+        }
 
         Ok(match space_id {
             pcode::REGISTER_SPACE => ExprValue::RegisterRef(pointer, size.unwrap_or(0)),
             pcode::RAM_SPACE => ExprValue::RamRef(pointer, size.unwrap_or(0)),
+            pcode::RAM2_SPACE => ExprValue::Ram2Ref(pointer, size.unwrap_or(0)),
             _ => panic!("unknown space_id: {space_id}"),
         })
     }

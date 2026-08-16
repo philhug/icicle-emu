@@ -60,14 +60,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Copy, Clone, Debug)]
 enum Operand {
     Value(ResolvedValue),
-    Pointer(ResolvedValue, u64, u16),
+    Pointer(ResolvedValue, u64, u16, pcode::MemId),
 }
 
 impl Operand {
     fn slice(self, offset: u16, size: u16) -> Self {
         match self {
             Self::Value(value) => Self::Value(value.slice(offset, size)),
-            Self::Pointer(value, base, _) => Self::Pointer(value, base + offset as u64, size),
+            Self::Pointer(value, base, _, space) => Self::Pointer(value, base + offset as u64, size, space),
         }
     }
 }
@@ -147,7 +147,7 @@ impl From<VarNode> for ResolvedValue {
 #[derive(Copy, Clone, Debug)]
 enum Output {
     Var(VarNode),
-    Pointer(ResolvedValue, u64, u16),
+    Pointer(ResolvedValue, u64, u16, pcode::MemId),
 }
 
 pub struct Lifter {
@@ -298,8 +298,8 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
                     if let (pcode::Op::Copy, Some(Output::Var(dst))) = (op, resolved_output) {
                         match self.resolve_operand(inputs[0])? {
                             Operand::Value(value) => self.emit_copy(value, dst)?,
-                            Operand::Pointer(addr, offset, _) => {
-                                self.emit_load(addr, offset, dst)?
+                            Operand::Pointer(addr, offset, _, space) => {
+                                self.emit_load(space, addr, offset, dst)?
                             }
                         }
                         continue;
@@ -336,10 +336,10 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
 
                     match resolved_output {
                         Some(Output::Var(dst)) => self.emit(*op, &resolved_inputs, Some(dst))?,
-                        Some(Output::Pointer(addr, offset, size)) => {
+                        Some(Output::Pointer(addr, offset, size, space)) => {
                             let dst = self.lifter.alloc_tmp(size)?;
                             self.emit(*op, &resolved_inputs, Some(dst))?;
-                            self.emit_store(addr, offset, dst.into())?;
+                            self.emit_store(space, addr, offset, dst.into())?;
                         }
                         None => self.emit(*op, &resolved_inputs, None)?,
                     }
@@ -353,7 +353,7 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
                                     ResolvedValue::Var(x) if !x.is_tmp => x.offset as u64,
                                     _ => return Err(Error::AddressOfTemporary),
                                 },
-                                Operand::Pointer(value, offset, _) => match value {
+                                Operand::Pointer(value, offset, _, _) => match value {
                                     ResolvedValue::Const(x, _) => x + offset,
                                     ResolvedValue::Var(x) if !x.is_tmp => x.offset as u64 + offset,
                                     _ => return Err(Error::AddressOfTemporary),
@@ -369,8 +369,8 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
                         Output::Var(dst) => {
                             self.emit_copy(ResolvedValue::Const(offset, dst.size), dst)?
                         }
-                        Output::Pointer(dst, offset, size) => {
-                            self.emit_store(dst, offset, ResolvedValue::Const(offset, size))?
+                        Output::Pointer(dst, offset, size, space) => {
+                            self.emit_store(space, dst, offset, ResolvedValue::Const(offset, size))?
                         }
                     };
                 }
@@ -391,8 +391,8 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
                                 self.push((dst, pcode::Op::Load(pcode::REGISTER_SPACE), reg));
                             }
                         },
-                        Output::Pointer(addr, offset, size) => {
-                            self.emit_store(addr, offset, reg_ptr.slice(0, size))?;
+                        Output::Pointer(addr, offset, size, space) => {
+                            self.emit_store(space, addr, offset, reg_ptr.slice(0, size))?;
                         }
                     }
                 }
@@ -481,7 +481,10 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
     fn resolve_export(&mut self, inner: Export) -> Result<Operand> {
         match inner {
             Export::Value(value) => Ok(self.resolve_value(value)?.into()),
-            Export::RamRef(ptr, size) => Ok(Operand::Pointer(self.resolve_value(ptr)?, 0, size)),
+            Export::RamRef(ptr, size) => Ok(Operand::Pointer(self.resolve_value(ptr)?, 0, size, pcode::RAM_SPACE)),
+            Export::Ram2Ref(ptr, size) => {
+                Ok(Operand::Pointer(self.resolve_value(ptr)?, 0, size, pcode::RAM2_SPACE))
+            }
             Export::RegisterRef(offset, size) => match self.resolve_value(offset)? {
                 ResolvedValue::Var(_) => Err(Error::InvalidExport(self.subtable.constructor.id)),
                 ResolvedValue::Const(x, _) => Ok(VarNode::register(x as u32, size).into()),
@@ -534,7 +537,7 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
             Local::SubtableRef(idx) => {
                 match self.subtable_export(idx).ok_or(Error::InvalidVarNode)? {
                     Operand::Value(value) => value.slice(value_offset, value_size).into(),
-                    Operand::Pointer(var, base, _) => {
+                    Operand::Pointer(var, base, _, _) => {
                         let offset = base.try_into().map_err(|_| Error::InvalidVarNode)?;
                         var.slice(offset, value_size).into()
                     }
@@ -569,9 +572,9 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
     fn resolve_value(&mut self, value: Value) -> Result<ResolvedValue> {
         Ok(match self.resolve_operand(value)? {
             Operand::Value(value) => value,
-            Operand::Pointer(addr, offset, size) => {
+            Operand::Pointer(addr, offset, size, space) => {
                 let dst = self.lifter.alloc_tmp(size)?;
-                self.emit_load(addr, offset, dst)?;
+                self.emit_load(space, addr, offset, dst)?;
                 dst.into()
             }
         })
@@ -591,7 +594,7 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
             // Non-zero constants are treated as errors to catch bugs.
             Operand::Value(ResolvedValue::Const(..)) => Err(Error::WriteToConstant),
             Operand::Value(ResolvedValue::Var(var)) => Ok(Output::Var(var)),
-            Operand::Pointer(base, offset, size) => Ok(Output::Pointer(base, offset, size)),
+            Operand::Pointer(base, offset, size, space) => Ok(Output::Pointer(base, offset, size, space)),
         }
     }
 
@@ -729,7 +732,7 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
             },
             pcode::Op::IntOr => self.emit_or(output, inputs[0], inputs[1]),
 
-            pcode::Op::Load(_) => self.emit_load(inputs[0], 0, output),
+            pcode::Op::Load(space) => self.emit_load(space, inputs[0], 0, output),
 
             _ => Err(Error::UnsupportedVarNodeSize(output.size)),
         }
@@ -776,26 +779,38 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         })
     }
 
-    fn emit_load(&mut self, addr: ResolvedValue, offset: u64, dst: VarNode) -> Result<()> {
+    fn emit_load(
+        &mut self,
+        space: pcode::MemId,
+        addr: ResolvedValue,
+        offset: u64,
+        dst: VarNode,
+    ) -> Result<()> {
         self.split_large_op(dst, |this, i, dst| {
             let addr = this.emit_add_offset(addr, offset + i as u64)?;
             let dst = this.get_runtime_var(dst)?;
-            this.push((dst, pcode::Op::Load(pcode::RAM_SPACE), addr));
+            this.push((dst, pcode::Op::Load(space), addr));
             Ok(())
         })
     }
 
-    fn emit_store(&mut self, addr: ResolvedValue, offset: u64, value: ResolvedValue) -> Result<()> {
+    fn emit_store(
+        &mut self,
+        space: pcode::MemId,
+        addr: ResolvedValue,
+        offset: u64,
+        value: ResolvedValue,
+    ) -> Result<()> {
         match value {
             ResolvedValue::Const(value, size) => {
                 let addr = self.emit_add_offset(addr, offset)?;
                 let value = pcode::Value::Const(value, self.resolve_var_size(size)?);
-                self.push((pcode::Op::Store(pcode::RAM_SPACE), pcode::Inputs::new(addr, value)));
+                self.push((pcode::Op::Store(space), pcode::Inputs::new(addr, value)));
             }
             ResolvedValue::Var(var) => self.split_large_op(var, |this, i, value| {
                 let addr = this.emit_add_offset(addr, offset + i as u64)?;
                 let var = this.get_runtime_var(value)?;
-                this.push((pcode::Op::Store(pcode::RAM_SPACE), pcode::Inputs::new(addr, var)));
+                this.push((pcode::Op::Store(space), pcode::Inputs::new(addr, var)));
                 Ok(())
             })?,
         }

@@ -178,7 +178,15 @@ impl SymbolTable {
     ///  - The name of the space overlaps with an existing identifier.
     pub fn define_space(&mut self, space: ast::Space) -> Result<(), String> {
         let id = match space.kind {
-            ast::SpaceKind::RamSpace => pcode::RAM_SPACE,
+            // The first RAM space maps to RAM_SPACE; a second RAM space (e.g. the
+            // RISC-V CSR space) maps to RAM2_SPACE.
+            ast::SpaceKind::RamSpace => {
+                if self.spaces.iter().any(|s| s.space_id == pcode::RAM_SPACE) {
+                    pcode::RAM2_SPACE
+                } else {
+                    pcode::RAM_SPACE
+                }
+            }
             ast::SpaceKind::RegisterSpace => pcode::REGISTER_SPACE,
             ast::SpaceKind::RomSpace => return Err("only ROM space not supported".into()),
         };
@@ -201,13 +209,23 @@ impl SymbolTable {
 
     /// Handles the association of identifiers to VarNodes within a space.
     ///
-    /// Returns an error if the space is not the `register` space (defining names for VarNodes in
-    /// other spaces is not currently supported), or if any identifier overlaps with an existing
-    /// identifier.
+    /// Returns an error if the space is neither the `register` space nor a RAM
+    /// space, or if any identifier overlaps with an existing identifier.
     pub fn define_register_names(&mut self, def: ast::SpaceNameDef) -> Result<(), String> {
-        if def.space != self.register_space_ident {
-            return Err("Can only name offsets within a register_space".into());
-        }
+        // Named registers are supported in the register space and in RAM spaces
+        // (e.g. the RISC-V CSR space). Resolve the target space's pcode ID.
+        let space_id = if def.space == self.register_space_ident {
+            pcode::REGISTER_SPACE
+        } else {
+            let space = self.lookup_kind(def.space, SymbolKind::Space)?;
+            let space_id = self.spaces[space as usize].space_id;
+            if space_id != pcode::RAM_SPACE && space_id != pcode::RAM2_SPACE {
+                return Err(format!(
+                    "Can only name offsets within a register_space or RAM space (got space_id {space_id})"
+                ));
+            }
+            space_id
+        };
 
         for (i, ident) in def.names.into_iter().enumerate() {
             if ident == self.placeholder_ident {
@@ -220,6 +238,7 @@ impl SymbolTable {
                 name: ident,
                 offset,
                 size: def.size,
+                space_id,
             })?;
         }
 
@@ -391,6 +410,7 @@ impl SymbolTable {
             name,
             constructors: vec![],
             export: None,
+            export_space: None,
         })?;
         Ok(())
     }
@@ -435,7 +455,23 @@ impl SymbolTable {
             ));
         }
 
+        let export_space = result.semantics.export.and_then(|value| match value {
+            sleigh_runtime::semantics::Export::RamRef(_, _) => Some(pcode::RAM_SPACE),
+            sleigh_runtime::semantics::Export::Ram2Ref(_, _) => Some(pcode::RAM2_SPACE),
+            _ => None,
+        });
+        if existing_table && table.export_space != export_space {
+            return Err(format!(
+                "Failed to add constructor \"{}\" to \"{}\": export space mismatch (existing: {:?}, new: {:?})",
+                constructor.display(&self.parser),
+                table.name.display(&self.parser),
+                table.export_space,
+                export_space
+            ));
+        }
+
         table.export = export_size;
+        table.export_space = export_space;
         table.constructors.push(self.constructors.len().try_into().unwrap());
 
         self.constructors.push(result);
@@ -482,6 +518,10 @@ pub(crate) struct Register {
 
     /// The size of the register (in bytes).
     pub size: ValueSize,
+
+    /// The pcode space this register lives in (normally REGISTER_SPACE; a
+    /// register named in a secondary RAM space, e.g. RISC-V CSRs, uses RAM2_SPACE).
+    pub space_id: pcode::MemId,
 }
 
 #[derive(Clone, Debug)]
@@ -559,6 +599,10 @@ pub(crate) struct Table {
 
     /// The size (in bytes) of the value exported by this table
     pub export: Option<ValueSize>,
+
+    /// The pcode memory space the exported value references, if it is a memory
+    /// reference (RAM, or RAM2 for e.g. RISC-V CSRs).
+    pub export_space: Option<pcode::MemId>,
 }
 
 #[derive(Debug, Clone)]

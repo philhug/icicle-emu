@@ -254,6 +254,18 @@ pub trait RegHandler {
     fn write(&mut self, cpu: &mut Cpu);
 }
 
+/// Handles a read of a secondary-RAM (RAM2 / CSR) location whose value is
+/// dynamic rather than stored in the backing buffer, e.g. the RISC-V `time`
+/// CSR (0xC01) read by `rdtime`. Return `None` to fall through to the buffer.
+pub trait Ram2ReadHandler {
+    fn read(&mut self, cpu: &mut Cpu, addr: u64, size: usize) -> Option<u64>;
+}
+
+/// Size (in bytes) of the backing store for the secondary RAM space (RAM2),
+/// e.g. the RISC-V CSR space. Covers the full 16-bit word-addressed space at
+/// an 8-byte word size (65536 * 8).
+pub const RAM2_SPACE_BYTES: usize = 0x80000;
+
 pub struct Cpu {
     pub regs: Regs,
     pub args: [u128; 8],
@@ -261,6 +273,7 @@ pub struct Cpu {
     pub enable_shadow_stack: bool,
 
     pub mem: Mmu,
+    pub ram2: Box<[u8]>,
     pub jit_ctx: JitContext,
 
     pub icount: u64,
@@ -283,6 +296,7 @@ pub struct Cpu {
     /// Optimization note: In the future we could reassign register IDs such that those with
     /// handlers associated are contiguous allowing for an easy lookup.
     reg_handlers: UnsafeCell<Vec<(i16, Box<dyn RegHandler>)>>,
+    ram2_read_handlers: UnsafeCell<Vec<(u64, Box<dyn Ram2ReadHandler>)>>,
 
     pc_offset: isize,
     pc_mask: u64,
@@ -308,6 +322,7 @@ impl Cpu {
             enable_shadow_stack: false,
 
             mem: Mmu::with_mask(address_mask),
+            ram2: vec![0u8; RAM2_SPACE_BYTES].into_boxed_slice(),
             jit_ctx: JitContext::default(),
 
             icount: 0,
@@ -323,6 +338,7 @@ impl Cpu {
 
             trace: Trace::default(),
             reg_handlers: UnsafeCell::new(vec![]),
+            ram2_read_handlers: UnsafeCell::new(vec![]),
 
             pc_offset,
             pc_mask,
@@ -331,6 +347,7 @@ impl Cpu {
 
     pub fn reset(&mut self) {
         self.regs.fill(0);
+        self.ram2.fill(0);
         for &(var, value) in &self.arch.reg_init {
             self.regs.write_trunc(var, value);
         }
@@ -359,6 +376,29 @@ impl Cpu {
 
     pub fn add_reg_handler(&mut self, id: pcode::VarId, handler: Box<dyn RegHandler>) {
         self.reg_handlers.get_mut().push((id, handler));
+    }
+
+    pub fn add_ram2_read_handler(&mut self, offset: u64, handler: Box<dyn Ram2ReadHandler>) {
+        self.ram2_read_handlers.get_mut().push((offset, handler));
+    }
+
+    /// Read `size` bytes from the secondary RAM (RAM2 / CSR) space at `addr`,
+    /// consulting any read handlers first (e.g. RISC-V `time`), then the buffer.
+    pub fn read_ram2(&mut self, addr: u64, size: usize) -> Option<u64> {
+        if let Some((_, handler)) =
+            unsafe { (*self.ram2_read_handlers.get()).iter_mut().find(|x| x.0 == addr) }
+        {
+            if let Some(value) = handler.read(self, addr, size) {
+                return Some(value);
+            }
+        }
+        let start = addr as usize;
+        let bytes = self.ram2.get(start..start.checked_add(size)?)?;
+        let mut value = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            value |= (b as u64) << (8 * i);
+        }
+        Some(value)
     }
 
     pub fn set_helper(&mut self, idx: u16, helper: PcodeOpHelper) {
@@ -654,6 +694,15 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
                 };
                 Some(self.cpu.read_var(var))
             }
+            pcode::RAM2_SPACE => {
+                let Some(v) = self.cpu.read_ram2(addr, N) else {
+                    self.exception(ExceptionCode::ReadUnmapped, addr);
+                    return None;
+                };
+                let mut value = [0; N];
+                value.copy_from_slice(&v.to_le_bytes()[..N]);
+                Some(value)
+            }
             pcode::RESERVED_SPACE_END.. => {
                 let offset = addr as usize;
                 let Some(slice) = self.cpu.trace.storage
@@ -692,6 +741,14 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
                     return None;
                 };
                 self.cpu.write_var(var, value);
+            }
+            pcode::RAM2_SPACE => {
+                let offset = addr as usize;
+                let Some(dst) = self.cpu.ram2.get_mut(offset..offset + N) else {
+                    self.exception(ExceptionCode::ReadUnmapped, addr);
+                    return None;
+                };
+                dst.copy_from_slice(&value);
             }
             pcode::RESERVED_SPACE_END.. => {
                 let offset = addr as usize;

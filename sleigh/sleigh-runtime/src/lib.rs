@@ -717,6 +717,7 @@ impl pcode::PcodeDisplay<SleighData> for pcode::SpaceId {
         match self.0 {
             pcode::RAM_SPACE => f.write_str("ram"),
             pcode::REGISTER_SPACE => f.write_str("register"),
+            pcode::RAM2_SPACE => f.write_str("ram2"),
             pcode::RESERVED_SPACE_END.. => write!(f, "mem.{}", self.0),
         }
     }

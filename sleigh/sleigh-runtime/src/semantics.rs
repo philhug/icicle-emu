@@ -56,6 +56,9 @@ pub enum Export {
     /// A pointer to an address in the RAM space.
     RamRef(Value, ValueSize),
 
+    /// A pointer to an address in a secondary RAM space (e.g. RISC-V CSRs).
+    Ram2Ref(Value, ValueSize),
+
     /// A dynamically computed register.
     RegisterRef(Value, ValueSize),
 }
@@ -65,6 +68,7 @@ impl Export {
         match self {
             Self::Value(inner) => inner.size,
             Self::RamRef(_, size) => Some(*size),
+            Self::Ram2Ref(_, size) => Some(*size),
             Self::RegisterRef(_, size) => Some(*size),
         }
     }
