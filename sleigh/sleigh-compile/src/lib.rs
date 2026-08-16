@@ -229,6 +229,17 @@ pub fn build_inner(mut parser: Parser, verbose: bool) -> Result<SleighData, Stri
         ctx.data.user_ops.push((start, end));
     }
 
+    // A dropped constructor means part of the spec silently decodes as
+    // invalid — always announce the total (per-constructor detail stays
+    // behind `verbose`).
+    if ctx.data.dropped_constructors > 0 {
+        eprintln!(
+            "[WARNING] sleigh: dropped {} constructor(s) during compilation; \
+             affected encodings will fail to decode (enable verbose for details)",
+            ctx.data.dropped_constructors
+        );
+    }
+
     Ok(ctx.data)
 }
 
@@ -355,6 +366,7 @@ fn resolve_item(ctx: &mut Context, syms: &mut SymbolTable, item: ast::Item) -> R
             }
 
             if let Err(e) = syms.define_constructor(ctx, &constructor) {
+                ctx.data.dropped_constructors += 1;
                 if ctx.verbose {
                     eprintln!("[WARNING] {e}");
                 }
@@ -548,6 +560,7 @@ fn mixed_value_and_memory_exports_in_one_table() {
     :ld rm is opbits=0x5 & rm { r1 = rm; }"#;
 
     let sleigh = build_inner(sleigh_parse::Parser::from_str(TEST_SPEC), true).unwrap();
+    assert_eq!(sleigh.dropped_constructors, 0, "legal mixed exports must not drop");
     let mut runtime = sleigh_runtime::Runtime::new(0);
 
     // mode=1: register-value alternative.
@@ -561,4 +574,36 @@ fn mixed_value_and_memory_exports_in_one_table() {
         .decode(&sleigh, 0x0, &[0x50])
         .expect("memory alternative failed to decode");
     assert_eq!(inst.inst_next, 1);
+}
+
+#[test]
+fn conflicting_memory_export_spaces_are_counted_as_dropped() {
+    // Two memory exports in *different* RAM spaces within one table is a
+    // genuine conflict: the constructor is dropped, and the drop must be
+    // visible to embedders via `dropped_constructors` (a silent drop cost a
+    // full debugging session when the x86 rm tables lost their memory
+    // constructors).
+    static TEST_SPEC: &str = r#"
+    define endian=big;
+    define alignment=1;
+
+    define space ram type=ram_space size=4 default;
+    define space csr type=ram_space size=2 wordsize=4;
+    define space register type=register_space size=4;
+
+    define register offset=0 size=4 [ r0 r1 ];
+
+    define token t1(8)
+        opbits=(4,7) mode=(3,3) idx=(0,2);
+
+    rm: "m1" is mode=1 { export *[ram]:4 r0; }
+    rm: "m2" is mode=0 { export *[csr]:4 r0; }
+
+    :ld rm is opbits=0x5 & rm { r1 = rm; }"#;
+
+    let sleigh = build_inner(sleigh_parse::Parser::from_str(TEST_SPEC), true).unwrap();
+    assert_eq!(
+        sleigh.dropped_constructors, 1,
+        "the csr-space constructor conflicts with the ram-space one and must be counted"
+    );
 }

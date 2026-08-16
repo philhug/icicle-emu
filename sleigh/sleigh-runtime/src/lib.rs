@@ -447,6 +447,11 @@ impl DebugInfo {
 
 #[derive(Default)]
 pub struct SleighData {
+    /// Number of constructors the compiler failed to add (e.g. export size or
+    /// space conflicts). Non-zero means part of the spec silently decodes as
+    /// invalid — embedders should surface this.
+    pub dropped_constructors: u32,
+
     pub strings: String,
 
     pub subtables: Vec<Table>,
