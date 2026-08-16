@@ -460,18 +460,29 @@ impl SymbolTable {
             sleigh_runtime::semantics::Export::Ram2Ref(_, _) => Some(pcode::RAM2_SPACE),
             _ => None,
         });
-        if existing_table && table.export_space != export_space {
-            return Err(format!(
-                "Failed to add constructor \"{}\" to \"{}\": export space mismatch (existing: {:?}, new: {:?})",
-                constructor.display(&self.parser),
-                table.name.display(&self.parser),
-                table.export_space,
-                export_space
-            ));
+        // A table may legally mix value exports (space `None`) with memory-ref
+        // exports — Ghidra's x86 `rm8`..`rm64` tables mix `export Rmr8` with
+        // `export *:1 Mem`. Only two memory exports in *different* spaces
+        // (RAM vs RAM2) conflict, since the table-level space is what the
+        // subtable-deref path in `resolve_address` resolves against.
+        if existing_table {
+            if let (Some(existing), Some(new)) = (table.export_space, export_space) {
+                if existing != new {
+                    return Err(format!(
+                        "Failed to add constructor \"{}\" to \"{}\": export space mismatch (existing: {:?}, new: {:?})",
+                        constructor.display(&self.parser),
+                        table.name.display(&self.parser),
+                        table.export_space,
+                        export_space
+                    ));
+                }
+            }
         }
 
         table.export = export_size;
-        table.export_space = export_space;
+        if export_space.is_some() {
+            table.export_space = export_space;
+        }
         table.constructors.push(self.constructors.len().try_into().unwrap());
 
         self.constructors.push(result);

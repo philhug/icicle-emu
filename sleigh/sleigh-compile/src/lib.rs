@@ -523,3 +523,42 @@ fn backtrack_with_offset() {
     let disasm = runtime.disasm(&sleigh).expect("failed to disassembly instruction");
     assert_eq!(disasm, "instr b 0x1");
 }
+
+#[test]
+fn mixed_value_and_memory_exports_in_one_table() {
+    // Ghidra's x86 `rm8`..`rm64` tables mix register-value exports with
+    // memory-ref exports (`rm8: Rmr8 is mod=3 { export Rmr8; }` vs
+    // `rm8: "byte ptr" Mem is Mem { export *:1 Mem; }`). Both alternatives
+    // must survive compilation and decode.
+    static TEST_SPEC: &str = r#"
+    define endian=big;
+    define alignment=1;
+
+    define space ram type=ram_space size=4 default;
+    define space register type=register_space size=4;
+
+    define register offset=0 size=4 [ r0 r1 ];
+
+    define token t1(8)
+        opbits=(4,7) mode=(3,3) idx=(0,2);
+
+    rm: "val" is mode=1 { export r0; }
+    rm: "mem" is mode=0 { export *:4 r0; }
+
+    :ld rm is opbits=0x5 & rm { r1 = rm; }"#;
+
+    let sleigh = build_inner(sleigh_parse::Parser::from_str(TEST_SPEC), true).unwrap();
+    let mut runtime = sleigh_runtime::Runtime::new(0);
+
+    // mode=1: register-value alternative.
+    let inst = runtime
+        .decode(&sleigh, 0x0, &[0x58])
+        .expect("register-value alternative failed to decode");
+    assert_eq!(inst.inst_next, 1);
+
+    // mode=0: memory alternative (dropped entirely before the fix).
+    let inst = runtime
+        .decode(&sleigh, 0x0, &[0x50])
+        .expect("memory alternative failed to decode");
+    assert_eq!(inst.inst_next, 1);
+}
