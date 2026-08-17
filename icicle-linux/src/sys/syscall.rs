@@ -505,6 +505,28 @@ pub fn recvfrom<C: LinuxCpu>(
     addrlen: u64,
 ) -> LinuxResult {
     let file = ctx.kernel.process.file_table.get(&mut ctx.kernel.process_manager, sockfd)?;
+
+    // Unlike `bind`/`connect`/`sendto`'s plain-value `addrlen`, `recvfrom`'s
+    // sixth argument is `socklen_t *addrlen`: a pointer to the guest's real
+    // buffer capacity, which the kernel is also expected to update with the
+    // address's true length on return. Reading it here used to be skipped,
+    // which meant the *pointer's own numeric value* -- always far larger
+    // than `SocketAddr`'s 64-byte storage -- passed the `min` below intact,
+    // so every non-null `addrlen` silently wrote the full 64 bytes regardless
+    // of what the guest actually allocated. Harmless while every backend left
+    // `sock_addr` zeroed (nothing to overrun into), but not once a real
+    // address is written back (UDP, from Task 5 on): a guest's ordinary
+    // 16-byte `sockaddr_in` on the stack would have 48 bytes of a stranger's
+    // socket address written past its end.
+    let addr_cap = if src_addr != NULL_PTR && addrlen != NULL_PTR {
+        let mut raw = [0u8; 4];
+        ctx.cpu.mem().read_bytes(addrlen, &mut raw)?;
+        u32::from_le_bytes(raw) as usize
+    }
+    else {
+        0
+    };
+
     let mut sock_addr = (src_addr != NULL_PTR).then(fs::socket::SocketAddr::default);
 
     let read_bytes = match do_recv(ctx, &file, sock_addr.as_mut(), buf, len) {
@@ -517,8 +539,11 @@ pub fn recvfrom<C: LinuxCpu>(
     };
 
     if let Some(addr) = sock_addr {
-        let len = usize::min(addrlen as usize, addr.addr.len());
-        ctx.cpu.mem().write_bytes(src_addr, &addr.addr[..len])?;
+        let write_len = usize::min(addr_cap, addr.addr.len());
+        ctx.cpu.mem().write_bytes(src_addr, &addr.addr[..write_len])?;
+        if addrlen != NULL_PTR {
+            ctx.cpu.mem().write_bytes(addrlen, &(write_len as u32).to_le_bytes())?;
+        }
     }
 
     Ok(read_bytes)

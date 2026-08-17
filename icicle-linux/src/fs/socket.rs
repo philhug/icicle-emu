@@ -96,9 +96,9 @@ pub trait NetBackend {
     /// closed the connection.
     fn recv(&self, h: i64, out: &mut [u8]) -> fs::Result<usize>;
 
-    /// Sends `buf` on `h` to `addr`. Datagram sockets only; unused until UDP
-    /// is wired up, but part of the seam so that adding it needs no change
-    /// here.
+    /// Sends `buf` on `h` to `addr`. Datagram sockets only -- see
+    /// [`UdpSocket`], which checks a destination on every call rather than
+    /// once at connect time.
     fn sendto(&self, h: i64, buf: &[u8], addr: &[u8]) -> fs::Result<usize>;
 
     /// Reads up to `out.len()` bytes from `h`, writing the sender's address
@@ -293,10 +293,104 @@ static TCP_SOCKET_VTABLE: InodeVtable = InodeVtable {
     ..UNIX_STREAM_VTABLE
 };
 
-// @fixme: proper UDP sockets
-pub type UdpSocket = UnixDgram;
+/// An `AF_INET`/`SOCK_DGRAM` socket, served entirely by the installed
+/// [`NetBackend`].
+///
+/// Connectionless, so there is no single moment like `TcpSocket::connect` to
+/// hang the host-side handle on -- `UDP_SOCKET_VTABLE` does not override
+/// `connect` at all (the default `ENOTSOCK`, unchanged from the AF_UNIX
+/// datagram behaviour this replaces). Instead the handle is opened lazily,
+/// on whichever of `sendto`/`recvfrom` the guest calls first: see
+/// [`UdpSocket::handle`]. The backend's `connect` leg is reused for that
+/// open with `kind = SOCK_DGRAM` and an empty address, since there is no
+/// destination to fix at open time -- every `sendto` still carries its own,
+/// which is what buys the per-datagram destination check the spec requires;
+/// the lazily-opened handle is just an ephemeral local socket, not a
+/// connection to anywhere.
+pub struct UdpSocket {
+    net: Option<Rc<dyn NetBackend>>,
+    handle: Option<i64>,
+    socket_addr: SocketAddr,
+}
 
-static UDP_SOCKET_VTABLE: InodeVtable = UNIX_DGRAM_VTABLE;
+impl UdpSocket {
+    fn new(net: Option<Rc<dyn NetBackend>>) -> Self {
+        Self { net, handle: None, socket_addr: SocketAddr::default() }
+    }
+
+    fn data(inode: &mut Inode) -> fs::Result<&mut Self> {
+        inode.data.downcast_mut::<Self>().ok_or(errno::ENOTSOCK)
+    }
+
+    /// The backend and handle for this socket, opening the host-side handle
+    /// on first use. `EACCES` when no backend is installed, matching
+    /// `TcpSocket::connect` -- a guest that is not meant to have network
+    /// access must be told so rather than silently succeeding against
+    /// nothing.
+    fn handle(inode: &mut Inode) -> fs::Result<(Rc<dyn NetBackend>, i64)> {
+        let socket = Self::data(inode)?;
+        if let Some(h) = socket.handle {
+            let net = socket.net.clone().ok_or(errno::EACCES)?;
+            return Ok((net, h));
+        }
+
+        let net = socket.net.clone().ok_or(errno::EACCES)?;
+        let h = net.connect(AF_INET, SOCK_DGRAM, &[])?;
+
+        let socket = Self::data(inode)?;
+        socket.handle = Some(h);
+        Ok((net, h))
+    }
+
+    pub fn sendto_udp(inode: &mut Inode, msg: &Message) -> fs::Result<usize> {
+        // `Message` carries no separate address length (unlike `connect`'s
+        // explicit `addr_len`), so the destination the backend sees is
+        // always the full fixed-size `SocketAddr` buffer, zero-padded past
+        // whatever the guest actually wrote -- harmless, since nothing reads
+        // past the family/port/address that matter.
+        let dest = msg.address.as_ref().ok_or(errno::EDESTADDRREQ)?;
+        let (net, handle) = Self::handle(inode)?;
+        let len = net.sendto(handle, msg.buf, &dest.addr)?;
+        Ok(usize::min(len, msg.buf.len()))
+    }
+
+    pub fn recvfrom_udp(inode: &mut Inode, msg: &mut Message) -> fs::Result<usize> {
+        let (net, handle) = Self::handle(inode)?;
+        let mut addr_buf = [0u8; SOCKET_STORAGE_SIZE];
+        let (len, addr_len) = net.recvfrom(handle, msg.buf, &mut addr_buf)?;
+
+        if let Some(dest) = msg.address.as_mut() {
+            let alen = usize::min(addr_len, SOCKET_STORAGE_SIZE);
+            dest.addr[..alen].copy_from_slice(&addr_buf[..alen]);
+        }
+
+        Ok(usize::min(len, msg.buf.len()))
+    }
+
+    pub fn bind_udp(inode: &mut Inode, addr: &SocketAddr) -> fs::Result<()> {
+        let socket = Self::data(inode)?;
+        socket.socket_addr = addr.clone();
+        Ok(())
+    }
+}
+
+/// Releases the host-side handle when the last file descriptor referring to
+/// this socket goes away. See `TcpSocket`'s `Drop` impl -- same rationale,
+/// same coverage of `close`/`dup2`/file-table teardown.
+impl Drop for UdpSocket {
+    fn drop(&mut self) {
+        if let (Some(net), Some(handle)) = (self.net.as_ref(), self.handle.take()) {
+            net.close(handle);
+        }
+    }
+}
+
+static UDP_SOCKET_VTABLE: InodeVtable = InodeVtable {
+    recvfrom: UdpSocket::recvfrom_udp,
+    sendto: UdpSocket::sendto_udp,
+    bind: UdpSocket::bind_udp,
+    ..DEFAULT_INODE_VTABLE
+};
 
 static NETLINK_VTABLE: InodeVtable = InodeVtable {
     recvfrom: |_, _| Err(errno::ENOSYS),
@@ -373,7 +467,7 @@ impl SocketFs {
 
         let (data, vtable): (Box<dyn std::any::Any>, &InodeVtable) = match kind {
             SOCK_STREAM => (Box::new(TcpSocket::new(self.net.clone())), &TCP_SOCKET_VTABLE),
-            SOCK_DGRAM => (Box::<UdpSocket>::default(), &UDP_SOCKET_VTABLE),
+            SOCK_DGRAM => (Box::new(UdpSocket::new(self.net.clone())), &UDP_SOCKET_VTABLE),
             _ => return Err(errno::ESOCKTNOSUPPORT),
         };
 
