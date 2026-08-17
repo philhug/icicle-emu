@@ -64,6 +64,16 @@ impl Default for SocketAddr {
 
 pub struct Message<'a> {
     pub address: Option<&'a mut SocketAddr>,
+    /// The address's true length in bytes, once a `recvfrom` implementation
+    /// that populates `address` has run. Distinct from `SocketAddr`'s
+    /// always-64-byte fixed storage: this is the length a caller should
+    /// report back to the guest as the address's real size (`recvfrom(2)`'s
+    /// `*addrlen`), independent of how much of that storage was actually
+    /// meaningful or how large the guest's own buffer was. Left at its
+    /// default `0` by any implementation that never touches `address` (every
+    /// TCP `recvfrom` today), which is exactly the right value: `0` means
+    /// "no address", not "empty buffer".
+    pub address_len: usize,
     pub buf: &'a mut [u8],
 }
 
@@ -359,10 +369,15 @@ impl UdpSocket {
         let mut addr_buf = [0u8; SOCKET_STORAGE_SIZE];
         let (len, addr_len) = net.recvfrom(handle, msg.buf, &mut addr_buf)?;
 
+        // `alen` is the address's true length (already <= SOCKET_STORAGE_SIZE
+        // -- `NetBackend::recvfrom`'s own contract), not the guest's buffer
+        // capacity: `msg.address_len` is what the syscall layer reports back
+        // as `*addrlen`, separate from `write_len`'s copy-safety clamp there.
+        let alen = usize::min(addr_len, SOCKET_STORAGE_SIZE);
         if let Some(dest) = msg.address.as_mut() {
-            let alen = usize::min(addr_len, SOCKET_STORAGE_SIZE);
             dest.addr[..alen].copy_from_slice(&addr_buf[..alen]);
         }
+        msg.address_len = alen;
 
         Ok(usize::min(len, msg.buf.len()))
     }

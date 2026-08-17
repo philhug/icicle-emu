@@ -423,7 +423,7 @@ fn do_send<C: LinuxCpu>(
     ctx.kernel.buffer.resize(len as usize, 0);
     ctx.cpu.mem().read_bytes(buf, &mut ctx.kernel.buffer)?;
 
-    let msg = fs::socket::Message { address, buf: &mut ctx.kernel.buffer };
+    let msg = fs::socket::Message { address, address_len: 0, buf: &mut ctx.kernel.buffer };
     Ok(file.borrow_mut().sendto(&msg)? as u64)
 }
 
@@ -478,21 +478,27 @@ pub fn sendmsg<C: LinuxCpu>(ctx: &mut Ctx<C>, socket: u64, msg: u64, _flags: u64
     Ok(total_written)
 }
 
+/// Reads through to `file`'s `recvfrom` and returns the byte count together
+/// with the address's true length (`0` if `address` was `None`, or if
+/// whatever answered never touched it -- see `socket::Message::address_len`).
+/// The second element only matters to a caller that also passed `Some`
+/// address; `recvmsg` (which does not yet report an address length back to
+/// the guest at all -- a separate, pre-existing gap) discards it.
 fn do_recv<C: LinuxCpu>(
     ctx: &mut Ctx<C>,
     file: &fs::ActiveFile,
     address: Option<&mut fs::socket::SocketAddr>,
     buf: u64,
     len: u64,
-) -> LinuxResult {
+) -> Result<(u64, usize), crate::LinuxError> {
     ctx.kernel.buffer.clear();
     ctx.kernel.buffer.resize(len as usize, 0);
 
-    let mut msg = fs::socket::Message { address, buf: &mut ctx.kernel.buffer };
+    let mut msg = fs::socket::Message { address, address_len: 0, buf: &mut ctx.kernel.buffer };
     let read_bytes = file.borrow_mut().recvfrom(&mut msg)?;
     ctx.cpu.mem().write_bytes(buf, &msg.buf[..read_bytes])?;
 
-    Ok(read_bytes as u64)
+    Ok((read_bytes as u64, msg.address_len))
 }
 
 pub fn recvfrom<C: LinuxCpu>(
@@ -529,8 +535,8 @@ pub fn recvfrom<C: LinuxCpu>(
 
     let mut sock_addr = (src_addr != NULL_PTR).then(fs::socket::SocketAddr::default);
 
-    let read_bytes = match do_recv(ctx, &file, sock_addr.as_mut(), buf, len) {
-        Ok(bytes) => bytes,
+    let (read_bytes, address_len) = match do_recv(ctx, &file, sock_addr.as_mut(), buf, len) {
+        Ok(v) => v,
         Err(crate::LinuxError::Error(errno::EWOULDBLOCK)) => {
             file.borrow_mut().listeners.insert(ctx.kernel.process.pid);
             return ctx.kernel.switch_task(ctx.cpu, crate::PauseReason::WaitFile);
@@ -539,10 +545,19 @@ pub fn recvfrom<C: LinuxCpu>(
     };
 
     if let Some(addr) = sock_addr {
-        let write_len = usize::min(addr_cap, addr.addr.len());
+        // Two different clamps, on purpose: `*addrlen` reports the address's
+        // real size (`address_len`, from `Message::address_len`) regardless
+        // of the guest's own buffer capacity -- real `recvfrom(2)` does the
+        // same, so a caller passing an oversized `sockaddr_storage` learns
+        // the address was genuinely only 16 bytes, not that it was 128 --
+        // while the copy into `src_addr` is still capped to `addr_cap` (plus
+        // `addr.addr.len()` as a second, always-safe bound): the guest's
+        // buffer must never be written past its declared capacity, whatever
+        // the address's true length turns out to be.
+        let write_len = usize::min(usize::min(address_len, addr_cap), addr.addr.len());
         ctx.cpu.mem().write_bytes(src_addr, &addr.addr[..write_len])?;
         if addrlen != NULL_PTR {
-            ctx.cpu.mem().write_bytes(addrlen, &(write_len as u32).to_le_bytes())?;
+            ctx.cpu.mem().write_bytes(addrlen, &(address_len as u32).to_le_bytes())?;
         }
     }
 
@@ -562,7 +577,11 @@ pub fn recvmsg<C: LinuxCpu>(ctx: &mut Ctx<C>, socket: u64, msg: u64, _flags: u64
         let (base, len) = (iov.base.value, iov.len.value);
 
         match do_recv(ctx, &file, sock_addr.as_mut(), base, len) {
-            Ok(bytes) => total_read += bytes,
+            // `recvmsg` does not write `msg_name`/`msg_namelen` back to the
+            // guest at all today (a separate, pre-existing gap this task
+            // does not touch), so the address length `do_recv` now also
+            // returns has nothing to report through here yet.
+            Ok((bytes, _address_len)) => total_read += bytes,
             Err(crate::LinuxError::Error(errno::EWOULDBLOCK)) => {
                 if total_read == 0 {
                     file.borrow_mut().listeners.insert(ctx.kernel.process.pid);
