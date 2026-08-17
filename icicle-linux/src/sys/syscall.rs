@@ -396,6 +396,22 @@ pub fn bind<C: LinuxCpu>(ctx: &mut Ctx<C>, sockfd: u64, addr: u64, addrlen: u64)
     Ok(0)
 }
 
+/// `connect(sockfd, addr, addrlen)`.
+///
+/// What the connection actually reaches is up to the socket: for `AF_INET`
+/// streams it is the host-side [`fs::socket::NetBackend`] the embedder
+/// installed, and `EACCES` when there is none.
+pub fn connect<C: LinuxCpu>(ctx: &mut Ctx<C>, sockfd: u64, addr: u64, addrlen: u64) -> LinuxResult {
+    let sockaddr =
+        fs::socket::SocketAddr::read_user(ctx.cpu.mem(), addr, addrlen)?.ok_or(errno::EFAULT)?;
+
+    let file = ctx.kernel.process.file_table.get(&mut ctx.kernel.process_manager, sockfd)?;
+    let len = usize::min(addrlen as usize, fs::socket::SOCKET_STORAGE_SIZE);
+    file.borrow_mut().connect(&sockaddr, len)?;
+
+    Ok(0)
+}
+
 fn do_send<C: LinuxCpu>(
     ctx: &mut Ctx<C>,
     file: &fs::ActiveFile,

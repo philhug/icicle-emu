@@ -239,6 +239,14 @@ impl ActiveFileData {
         }
         (inode.vtable.bind)(&mut inode, addr)
     }
+
+    pub fn connect(&mut self, addr: &socket::SocketAddr, addr_len: usize) -> Result<()> {
+        let mut inode = self.inode.borrow_mut();
+        if inode.hooked {
+            return Err(errno::HOOKED);
+        }
+        (inode.vtable.connect)(&mut inode, addr, addr_len)
+    }
 }
 
 bitflags::bitflags! {

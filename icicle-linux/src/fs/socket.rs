@@ -67,6 +67,51 @@ pub struct Message<'a> {
     pub buf: &'a mut [u8],
 }
 
+/// A host-side provider of real network access.
+///
+/// icicle-linux has no networking of its own and cannot depend on whatever
+/// embeds it, so this is the neutral seam: an embedder installs an
+/// implementation with [`SocketFs::set_net_backend`], and every network socket
+/// the guest creates afterwards routes its `connect`/`send`/`recv`/`close`
+/// through it. With no backend installed the guest cannot reach a network at
+/// all — [`TcpSocket::connect`] answers `EACCES` — so networking is off unless
+/// an embedder deliberately turns it on.
+///
+/// Handles are opaque to icicle: [`NetBackend::connect`] returns whatever
+/// non-negative value identifies the connection on the host side, and the
+/// socket inode hands that same value back on every later call. Errors are
+/// plain errno values, reported to the guest unchanged.
+pub trait NetBackend {
+    /// Opens a host socket of `domain`/`kind` (the `AF_*`/`SOCK_*` values the
+    /// guest passed to `socket`) connected — or, for datagram sockets, bound —
+    /// to `addr`, the raw `sockaddr` bytes the guest passed to `connect`.
+    /// Returns an opaque non-negative handle.
+    fn connect(&self, domain: u64, kind: u64, addr: &[u8]) -> fs::Result<i64>;
+
+    /// Sends `buf` on the connected handle `h`, returning the number of bytes
+    /// accepted.
+    fn send(&self, h: i64, buf: &[u8]) -> fs::Result<usize>;
+
+    /// Reads up to `out.len()` bytes from `h`. A return of 0 means the peer
+    /// closed the connection.
+    fn recv(&self, h: i64, out: &mut [u8]) -> fs::Result<usize>;
+
+    /// Sends `buf` on `h` to `addr`. Datagram sockets only; unused until UDP
+    /// is wired up, but part of the seam so that adding it needs no change
+    /// here.
+    fn sendto(&self, h: i64, buf: &[u8], addr: &[u8]) -> fs::Result<usize>;
+
+    /// Reads up to `out.len()` bytes from `h`, writing the sender's address
+    /// into `addr`. Returns the byte count and the address length. Datagram
+    /// sockets only; see [`NetBackend::sendto`].
+    fn recvfrom(&self, h: i64, out: &mut [u8], addr: &mut [u8]) -> fs::Result<(usize, usize)>;
+
+    /// Releases `h`. Called when the last file descriptor referring to the
+    /// socket goes away, from a context that cannot report an error, so any
+    /// failure is the backend's to handle.
+    fn close(&self, h: i64);
+}
+
 static UNIX_DGRAM_VTABLE: InodeVtable =
     InodeVtable { recvfrom: UnixDgram::recvfrom, bind: UnixStream::bind, ..DEFAULT_INODE_VTABLE };
 
@@ -140,22 +185,111 @@ impl UnixStream {
     }
 }
 
-// @fixme: proper tcp sockets
-pub type TcpSocket = UnixStream;
+/// An `AF_INET`/`SOCK_STREAM` socket, served entirely by the installed
+/// [`NetBackend`].
+///
+/// The socket owns nothing but the handle the backend gave it: there is no
+/// in-emulator byte queue, because every `send`/`recv` is a round trip to the
+/// host. `handle` is `None` until `connect` succeeds, which is what makes
+/// `send`/`recv` on an unconnected socket `ENOTCONN`; `net` is `None` when the
+/// embedder installed no backend at all, which makes `connect` itself
+/// `EACCES`.
+pub struct TcpSocket {
+    net: Option<Rc<dyn NetBackend>>,
+    handle: Option<i64>,
+    socket_addr: SocketAddr,
+}
 
 impl TcpSocket {
-    pub fn recvfrom_tcp(_inode: &mut Inode, _msg: &mut Message) -> fs::Result<usize> {
-        Err(errno::ENOTCONN)
+    fn new(net: Option<Rc<dyn NetBackend>>) -> Self {
+        Self { net, handle: None, socket_addr: SocketAddr::default() }
     }
 
-    pub fn sendto_tcp(_inode: &mut Inode, _msg: &Message) -> fs::Result<usize> {
-        Err(errno::ENOTCONN)
+    fn data(inode: &mut Inode) -> fs::Result<&mut Self> {
+        inode.data.downcast_mut::<Self>().ok_or(errno::ENOTSOCK)
+    }
+
+    /// The backend and handle of a connected socket.
+    ///
+    /// Both are copied out rather than borrowed, so that no borrow derived
+    /// from the inode's data is still outstanding while the backend runs. (The
+    /// caller's `RefMut` on the inode itself is: a host that re-enters the
+    /// emulator through the same file descriptor from inside a callback still
+    /// panics, exactly as it does for the file-system callbacks.)
+    fn connected(inode: &mut Inode) -> fs::Result<(Rc<dyn NetBackend>, i64)> {
+        let socket = Self::data(inode)?;
+        let handle = socket.handle.ok_or(errno::ENOTCONN)?;
+        let net = socket.net.clone().ok_or(errno::ENOTCONN)?;
+        Ok((net, handle))
+    }
+
+    /// Opens the host-side connection described by `addr` (the first
+    /// `addr_len` bytes are the guest's `sockaddr`).
+    ///
+    /// `EACCES` when no backend is installed: a guest that is not meant to
+    /// have network access must be told so, rather than silently succeeding
+    /// against nothing.
+    pub fn connect(inode: &mut Inode, addr: &SocketAddr, addr_len: usize) -> fs::Result<()> {
+        let net = {
+            let socket = Self::data(inode)?;
+            if socket.handle.is_some() {
+                return Err(errno::EISCONN);
+            }
+            socket.net.clone().ok_or(errno::EACCES)?
+        };
+
+        let len = usize::min(addr_len, SOCKET_STORAGE_SIZE);
+        let handle = net.connect(AF_INET, SOCK_STREAM, &addr.addr[..len])?;
+
+        let socket = Self::data(inode)?;
+        socket.handle = Some(handle);
+        socket.socket_addr = addr.clone();
+        Ok(())
+    }
+
+    pub fn recvfrom_tcp(inode: &mut Inode, msg: &mut Message) -> fs::Result<usize> {
+        let (net, handle) = Self::connected(inode)?;
+        let len = net.recv(handle, msg.buf)?;
+        // A backend that over-reports would otherwise hand the guest bytes
+        // from past the end of the buffer it asked for.
+        Ok(usize::min(len, msg.buf.len()))
+    }
+
+    pub fn sendto_tcp(inode: &mut Inode, msg: &Message) -> fs::Result<usize> {
+        let (net, handle) = Self::connected(inode)?;
+        let len = net.send(handle, msg.buf)?;
+        Ok(usize::min(len, msg.buf.len()))
+    }
+
+    pub fn bind_tcp(inode: &mut Inode, addr: &SocketAddr) -> fs::Result<()> {
+        let socket = Self::data(inode)?;
+        socket.socket_addr = addr.clone();
+        Ok(())
+    }
+}
+
+/// Releases the host-side connection when the last file descriptor referring
+/// to this socket goes away.
+///
+/// The inode is what owns the handle, so its destruction is the one event that
+/// covers every way a socket can go: an explicit `close`, a descriptor being
+/// reassigned by `dup2`, or the file table being torn down. There is nowhere
+/// to report a failure to, which is why [`NetBackend::close`] returns nothing.
+impl Drop for TcpSocket {
+    fn drop(&mut self) {
+        if let (Some(net), Some(handle)) = (self.net.as_ref(), self.handle.take()) {
+            net.close(handle);
+        }
     }
 }
 
 static TCP_SOCKET_VTABLE: InodeVtable = InodeVtable {
+    connect: TcpSocket::connect,
     recvfrom: TcpSocket::recvfrom_tcp,
     sendto: TcpSocket::sendto_tcp,
+    // Not inherited from `UNIX_STREAM_VTABLE`: that one downcasts the inode's
+    // data to `UnixStream`, which a `TcpSocket` no longer is.
+    bind: TcpSocket::bind_tcp,
     ..UNIX_STREAM_VTABLE
 };
 
@@ -172,11 +306,32 @@ static NETLINK_VTABLE: InodeVtable = InodeVtable {
 
 pub struct SocketFs {
     fs: Rc<RefCell<TempFs>>,
+    /// Where network sockets get their host access from, if an embedder
+    /// installed one. Handed to each socket as it is created, so a backend
+    /// installed later does not retroactively connect sockets that already
+    /// exist.
+    net: Option<Rc<dyn NetBackend>>,
 }
 
 impl SocketFs {
     pub fn create(dev_id: usize) -> Self {
-        Self { fs: TempFs::create(dev_id) }
+        Self { fs: TempFs::create(dev_id), net: None }
+    }
+
+    /// Installs the host-side network provider, replacing any previous one.
+    /// See [`NetBackend`]; without this call the guest has no network access.
+    pub fn set_net_backend(&mut self, net: Rc<dyn NetBackend>) {
+        self.net = Some(net);
+    }
+
+    /// Drops the reference to the host-side network provider.
+    ///
+    /// For embedders that must guarantee no callback runs after some point
+    /// (typically their own teardown): sockets created before this still hold
+    /// their own reference and will still close through it, so this only stops
+    /// *new* sockets from reaching the backend.
+    pub fn clear_net_backend(&mut self) {
+        self.net = None;
     }
 
     pub fn create_socket(&mut self, family: u64, kind: u64, protocol: u64) -> fs::Result<InodeRef> {
@@ -217,7 +372,7 @@ impl SocketFs {
         }
 
         let (data, vtable): (Box<dyn std::any::Any>, &InodeVtable) = match kind {
-            SOCK_STREAM => (Box::<TcpSocket>::default(), &TCP_SOCKET_VTABLE),
+            SOCK_STREAM => (Box::new(TcpSocket::new(self.net.clone())), &TCP_SOCKET_VTABLE),
             SOCK_DGRAM => (Box::<UdpSocket>::default(), &UDP_SOCKET_VTABLE),
             _ => return Err(errno::ESOCKTNOSUPPORT),
         };

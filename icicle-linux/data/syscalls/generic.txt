@@ -198,7 +198,7 @@
 200     bind                                sys::bind(3)
 201     listen                              sys::unimplemented(0)
 202     accept                              sys::unimplemented(0)
-203     connect                             sys::unimplemented(0)
+203     connect                             sys::connect(3)
 204     getsockname                         sys::unimplemented(0)
 205     getpeername                         sys::unimplemented(0)
 206     sendto                              sys::sendto(6)

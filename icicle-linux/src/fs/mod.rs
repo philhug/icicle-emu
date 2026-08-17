@@ -97,6 +97,11 @@ pub struct InodeVtable {
     /// Bind a socket to an address.
     pub bind: fn(inode: &mut Inode, addr: &socket::SocketAddr) -> Result<()>,
 
+    /// Connect a socket to `addr`, of which the first `addr_len` bytes are
+    /// significant (`SocketAddr` is a fixed-size buffer, so the length has to
+    /// travel alongside it).
+    pub connect: fn(inode: &mut Inode, addr: &socket::SocketAddr, addr_len: usize) -> Result<()>,
+
     /// Get reference to the raw underlying bytes of `inode`.
     ///
     /// @fixme: this is currently used for mmaping a file, however this api does not allow
@@ -140,6 +145,7 @@ pub static DEFAULT_INODE_VTABLE: InodeVtable = InodeVtable {
     recvfrom: |_, _| Err(errno::ENOTSOCK),
     sendto: |_, _| Err(errno::ENOTSOCK),
     bind: |_, _| Err(errno::ENOTSOCK),
+    connect: |_, _, _| Err(errno::ENOTSOCK),
     slice: |_, _, _| Err(errno::EPERM),
     iterate_dir: |_, _| Err(errno::ENOTDIR),
     create_dir: |_, _, _| Err(errno::ENOTDIR),
