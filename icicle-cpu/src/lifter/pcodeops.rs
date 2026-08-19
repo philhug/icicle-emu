@@ -72,6 +72,16 @@ fn sleep(
     gen_exception(arch, inputs, state, ExceptionCode::Sleep)
 }
 
+fn exception_return(
+    arch: &Arch,
+    _: pcode::PcodeOpId,
+    inputs: pcode::Inputs,
+    _: pcode::VarNode,
+    state: &mut BlockState,
+) -> bool {
+    gen_exception(arch, inputs, state, ExceptionCode::ExceptionReturn)
+}
+
 fn breakpoint(
     arch: &Arch,
     _: pcode::PcodeOpId,
@@ -205,6 +215,16 @@ pub mod aarch64 {
                     false
                 }),
             );
+        }
+
+        if let Some(id) = cpu.arch.sleigh.get_userop("WaitForInterrupt") {
+            injectors.insert(id, Box::new(sleep));
+        }
+        if let Some(id) = cpu.arch.sleigh.get_userop("WaitForEvent") {
+            injectors.insert(id, Box::new(sleep));
+        }
+        if let Some(id) = cpu.arch.sleigh.get_userop("ExceptionReturn") {
+            injectors.insert(id, Box::new(exception_return));
         }
     }
 }

@@ -114,6 +114,47 @@ fn build_aarch64() {
 }
 
 #[test]
+fn aarch64_eret_raises_exception_return() {
+    // `eret` (0xd69f03e0) must raise `ExceptionReturn` for the environment to
+    // handle, not fault as an unimplemented user op. Checked on both the JIT and
+    // the interpreter: `eret`'s SLEIGH `pc = ExceptionReturn(); return [pc];`
+    // leaves a dead `BlockExit::Return` behind, which must not run.
+    static CODE: &[u8] = &[0xe0, 0x03, 0x9f, 0xd6];
+
+    for enable_jit in [true, false] {
+        let mut vm = crate::build(&Config {
+            triple: "aarch64-none".parse().unwrap(),
+            enable_jit,
+            ..Config::default()
+        })
+        .unwrap();
+        vm.cpu.mem.map_memory_len(0x0, 0x100, Mapping { perm: perm::READ | perm::EXEC, value: 0 });
+        vm.cpu.mem.write_bytes(0x0, CODE, perm::NONE).unwrap();
+        vm.cpu.write_pc(0x0);
+
+        assert_eq!(
+            vm.step(1),
+            VmExit::UnhandledException((ExceptionCode::ExceptionReturn, 0)),
+            "eret with enable_jit={enable_jit}"
+        );
+    }
+}
+
+#[test]
+fn aarch64_wfi_parks() {
+    let mut vm = crate::build(&Config::from_target_triple("aarch64-none")).unwrap();
+    vm.cpu.mem.map_memory_len(0x0, 0x100, Mapping { perm: perm::READ | perm::EXEC, value: 0 });
+
+    // `wfi` (0xd503207f) must park as `Sleep` (surfaced as `VmExit::Halt`), not
+    // fault: the AArch64 module previously had no `WaitForInterrupt` injector.
+    static CODE: &[u8] = &[0x7f, 0x20, 0x03, 0xd5];
+    vm.cpu.mem.write_bytes(0x0, CODE, perm::NONE).unwrap();
+    vm.cpu.write_pc(0x0);
+
+    assert_eq!(vm.step(1), VmExit::Halt);
+}
+
+#[test]
 fn build_m68k() {
     let _ = crate::build(&Config::from_target_triple("m68k-none")).unwrap();
 }
