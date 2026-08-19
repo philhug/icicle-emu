@@ -1,4 +1,5 @@
 mod builder;
+pub mod kvm;
 pub mod debug;
 pub mod elf_dump;
 pub mod env;
@@ -35,10 +36,19 @@ use crate::{cpu::EnvironmentAny, injector::CodeInjectorAny};
 
 const TRACE_EXEC: bool = false;
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum Backend {
+    /// Lift to p-code and JIT (or interpret) in-process. Default.
+    Jit,
+    /// Run on the host natively through KVM (x86-64 first).
+    Kvm,
+}
+
 pub struct Vm {
     pub cpu: Box<Cpu>,
     pub env: Box<dyn EnvironmentAny>,
     pub lifter: lifter::BlockLifter,
+    pub backend: Backend,
     pub icount_limit: u64,
     pub next_timer: u64,
     pub interrupt_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -77,6 +87,7 @@ impl Vm {
             cpu,
             env: Box::new(()),
             lifter,
+            backend: Backend::Jit,
             injectors: Vec::new(),
             icount_limit: u64::MAX,
             next_timer: 0,
@@ -170,6 +181,10 @@ impl Vm {
 
     /// Runs the VM until it encounters an exit condition.
     pub fn run(&mut self) -> VmExit {
+        if self.backend == Backend::Kvm {
+            return self.run_kvm();
+        }
+
         if self.should_recompile() && self.enable_recompilation {
             self.recompile();
         }
@@ -223,6 +238,11 @@ impl Vm {
     pub(crate) fn get_block_key(&self, vaddr: u64) -> BlockKey {
         let isa_mode = self.cpu.isa_mode() as u64;
         BlockKey { vaddr, isa_mode }
+    }
+
+    /// Run on the host natively through KVM. Delegates to the kvm engine.
+    fn run_kvm(&mut self) -> VmExit {
+        crate::kvm::run(self)
     }
 
     fn handle_exception(&mut self) -> VmExit {

@@ -183,3 +183,13 @@ fn build_riscv64() {
 fn build_x86_64() {
     let _ = crate::build(&Config::from_target_triple("x86_64-none")).unwrap();
 }
+
+#[test]
+fn default_backend_is_jit() {
+    // The seam: `Vm` gains a `backend` field and `run()` dispatches on it. The
+    // default must stay the JIT so existing callers are unaffected; nothing may
+    // construct a KVM VM unless explicitly asked. The JIT run path itself is
+    // exercised by the rest of this suite (which keeps passing unchanged).
+    let vm = crate::build(&Config::from_target_triple("x86_64-none")).unwrap();
+    assert_eq!(vm.backend, crate::Backend::Jit);
+}
