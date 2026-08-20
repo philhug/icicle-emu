@@ -49,6 +49,9 @@ pub struct Vm {
     pub env: Box<dyn EnvironmentAny>,
     pub lifter: lifter::BlockLifter,
     pub backend: Backend,
+    /// The KVM engine, constructed lazily on the first `run()` when
+    /// `backend == Backend::Kvm`. None under the default JIT backend.
+    pub kvm: Option<crate::kvm::Vcpu>,
     pub icount_limit: u64,
     pub next_timer: u64,
     pub interrupt_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -88,6 +91,7 @@ impl Vm {
             env: Box::new(()),
             lifter,
             backend: Backend::Jit,
+            kvm: None,
             injectors: Vec::new(),
             icount_limit: u64::MAX,
             next_timer: 0,
@@ -242,7 +246,142 @@ impl Vm {
 
     /// Run on the host natively through KVM. Delegates to the kvm engine.
     fn run_kvm(&mut self) -> VmExit {
-        crate::kvm::run(self)
+        // Lazy construction: the engine is created the first time the VM runs
+        // with `Backend::Kvm`, then reused across `run()` calls (copy-in/out
+        // each time keeps the paged `Mmu` and the memslot buffer in sync).
+        if self.kvm.is_none() {
+            match crate::kvm::Vcpu::new() {
+                Ok(v) => self.kvm = Some(v),
+                Err(e) => {
+                    tracing::error!("kvm: {}", e);
+                    return VmExit::UnhandledException((
+                        crate::cpu::ExceptionCode::InternalError,
+                        0xE0, // backend unavailable
+                    ));
+                }
+            }
+        }
+        let vcpu = self.kvm.as_mut().unwrap();
+
+        // The guest's flat physical memory lives in the Mmu. Find its contiguous
+        // extent [lo, hi) and mirror it into the memslot buffer.
+        let b = vcpu.guest_ram().1;
+        let (lo, hi) = {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for (s, e, mp) in self.cpu.mem.mapping.iter() {
+                use crate::cpu::mem::MemoryMapping;
+                if let MemoryMapping::Physical(_) | MemoryMapping::Unallocated(_) = mp {
+                    lo = lo.min(s);
+                    hi = hi.max(e);
+                }
+            }
+            (lo, hi)
+        };
+        if lo == u64::MAX {
+            return VmExit::UnhandledException((
+                crate::cpu::ExceptionCode::InternalError,
+                0xE1, // no mapped guest RAM
+            ));
+        }
+        let size = (hi - lo) as usize;
+        if b < size {
+            if let Err(e) = vcpu.install_memory(lo, size) {
+                tracing::error!("kvm: {}", e);
+                return VmExit::UnhandledException((
+                    crate::cpu::ExceptionCode::InternalError,
+                    0xE2,
+                ));
+            }
+        }
+
+        // Copy paged Mmu RAM → contiguous memslot buffer.
+        {
+            let ram_ranges: Vec<(u64, u64)> = {
+                use crate::cpu::mem::MemoryMapping;
+                let mut v = Vec::new();
+                for (s, e, mp) in self.cpu.mem.mapping.iter() {
+                    if let MemoryMapping::Physical(_) | MemoryMapping::Unallocated(_) = mp {
+                        v.push((s, e));
+                    }
+                }
+                v
+            };
+            let (ptr, len) = vcpu.guest_ram();
+            let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+            for (s, e) in ram_ranges {
+                let off_s = s.saturating_sub(lo) as usize;
+                let off_e = e.saturating_sub(lo) as usize;
+                if off_e > off_s && off_e <= buf.len() {
+                    let _ = self
+                        .cpu
+                        .mem
+                        .read_bytes(s, &mut buf[off_s..off_e], crate::cpu::mem::perm::NONE);
+                }
+            }
+        }
+
+        // Set up a flat x86-64 long-mode vCPU at the current PC.
+        let entry = self.cpu.read_pc();
+        let ram_base = lo;
+        if let Err(e) = vcpu.setup_x86_64(ram_base, entry) {
+            tracing::error!("kvm: {}", e);
+            return VmExit::UnhandledException((crate::cpu::ExceptionCode::InternalError, 0xE3));
+        }
+
+        let exit = {
+            let mmu = &mut self.cpu.mem;
+            vcpu.run_loop(
+                |is_io, addr, is_write, data| {
+                    if is_io {
+                        // Port I/O has no Mmu backing; the engine currently
+                        // reports it (the acceptance example routes console
+                        // output through a port). Non-write reads return zeros.
+                        if is_write {
+                            eprint!("{}", String::from_utf8_lossy(data));
+                        } else {
+                            data.fill(0);
+                        }
+                        return Ok(());
+                    }
+                    let err = if is_write {
+                        mmu.write_bytes(addr, data, crate::cpu::mem::perm::NONE)
+                    } else {
+                        mmu.read_bytes(addr, data, crate::cpu::mem::perm::NONE)
+                    };
+                    err.map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmio"))
+                },
+                self.icount_limit.saturating_sub(self.cpu.icount).max(1),
+            )
+        };
+
+        // Copy memslot buffer back into paged Mmu RAM.
+        {
+            let ram_ranges: Vec<(u64, u64)> = {
+                use crate::cpu::mem::MemoryMapping;
+                let mut v = Vec::new();
+                for (s, e, mp) in self.cpu.mem.mapping.iter() {
+                    if let MemoryMapping::Physical(_) | MemoryMapping::Unallocated(_) = mp {
+                        v.push((s, e));
+                    }
+                }
+                v
+            };
+            let (ptr, len) = vcpu.guest_ram();
+            let buf = unsafe { std::slice::from_raw_parts(ptr, len) };
+            for (s, e) in ram_ranges {
+                let off_s = s.saturating_sub(lo) as usize;
+                let off_e = e.saturating_sub(lo) as usize;
+                if off_e > off_s && off_e <= buf.len() {
+                    let _ = self
+                        .cpu
+                        .mem
+                        .write_bytes(s, &buf[off_s..off_e], crate::cpu::mem::perm::NONE);
+                }
+            }
+        }
+
+        exit
     }
 
     fn handle_exception(&mut self) -> VmExit {
