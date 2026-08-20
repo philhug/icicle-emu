@@ -209,16 +209,25 @@ pub fn ignore<C: LinuxCpu>(ctx: &mut Ctx<C>) -> LinuxResult {
 }
 
 pub fn read<C: LinuxCpu>(ctx: &mut Ctx<C>, fd: u64, buf: u64, count: u64) -> LinuxResult {
-    // Read the bytes from the file into a temporary buffer
+    // Read the bytes from the file into a fresh temporary buffer.
+    // `InodeVtable::read` fills `buf` from index 0 (the `offset` is the *file*
+    // offset) and returns how many bytes it placed there; it is not an append
+    // like `read_user`. The scratch buffer must therefore be presented empty --
+    // `kernel.buffer` may hold a stale prefix from a prior `writev`/`openat`,
+    // which used to make this index `tmp[start..]` out of range -- and the
+    // result read back from `[..read_bytes]`.
     let mut tmp = std::mem::take(&mut ctx.kernel.buffer);
-    let start = tmp.len();
-    tmp.resize(start + count as usize, 0);
+    tmp.resize(count as usize, 0);
 
     let file = ctx.kernel.get_file(fd)?;
     let read_bytes = file.borrow_mut().read(&mut tmp)?;
 
+    // Clamp anyway: an out-of-contract filesystem must never be able to abort
+    // the process over the syscall edge.
+    let read_bytes = read_bytes.min(count as usize);
+
     // Write buffer to userspace
-    ctx.cpu.mem().write_bytes(buf, &tmp[start..start + read_bytes])?;
+    ctx.cpu.mem().write_bytes(buf, &tmp[..read_bytes])?;
     ctx.kernel.buffer = tmp;
 
     // Return the number of bytes read from the file
