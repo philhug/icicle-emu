@@ -647,6 +647,7 @@ dependencies = [
  "icicle-jit",
  "icicle-linux",
  "ihex",
+ "libc",
  "object 0.38.1",
  "pcode",
  "ron",
