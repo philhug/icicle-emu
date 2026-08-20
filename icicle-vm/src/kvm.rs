@@ -40,20 +40,24 @@ pub const EXIT_EXCEPTION: u32 = 3;
 pub const EXIT_SHUTDOWN: u32 = 8;
 pub const EXIT_UNKNOWN: u32 = 0;
 
-/// KVM_EXIT_IO sub-fields: direction (0=in,1=out), size, port.
+/// KVM_EXIT_IO sub-fields within the mmap'd `struct kvm_run` (verified against
+/// linux/kvm.h): the union lands at byte 32, and io is { direction u8, size u8,
+/// port u16, count u32, data_offset u64 }. `data_offset` is relative to the
+/// kvm_run base; the payload is at run + data_offset.
 pub const KVM_RUN_IO_DIRECTION: usize = 32;
 pub const KVM_RUN_IO_SIZE: usize = 33;
 pub const KVM_RUN_IO_PORT: usize = 34;
-pub const KVM_RUN_IO_DATA: usize = 64;
+pub const KVM_RUN_IO_DATA_OFFSET: usize = 40;
 
 /// Offsets within the mmap'd `struct kvm_run` (verified against linux/kvm.h):
-/// exit_reason at 8, then (union) mmio.phys_addr at 40, data at 48, len at 56,
-/// is_write at 60.
+/// exit_reason at 8; the union at 32. kvm_mmio: phys_addr 32, data 40, len 48,
+/// is_write 52 (1-byte). kvm_io: direction 32, size 33, port 34, count 36,
+/// data_offset 40 (relative to the kvm_run base).
 pub const KVM_RUN_EXIT_REASON: usize = 8;
-pub const KVM_RUN_MMIO_PHYS: usize = 40;
-pub const KVM_RUN_MMIO_DATA: usize = 48;
-pub const KVM_RUN_MMIO_LEN: usize = 56;
-pub const KVM_RUN_MMIO_IS_WRITE: usize = 60;
+pub const KVM_RUN_MMIO_PHYS: usize = 32;
+pub const KVM_RUN_MMIO_DATA: usize = 40;
+pub const KVM_RUN_MMIO_LEN: usize = 48;
+pub const KVM_RUN_MMIO_IS_WRITE: usize = 52;
 
 /// `struct kvm_regs` is 144 bytes (18 u64s); `struct kvm_sregs` is 312 bytes.
 /// Field offsets (verified against the local kernel): cs=0, ds=24 (each
@@ -603,7 +607,10 @@ impl Vcpu {
                     let size = unsafe { (run.add(KVM_RUN_IO_SIZE) as *const u8).read_volatile() };
                     let port =
                         unsafe { (run.add(KVM_RUN_IO_PORT) as *const u16).read_volatile() };
-                    let data_ptr = unsafe { run.add(KVM_RUN_IO_DATA) } as *const u8;
+                    // data_offset is relative to the kvm_run base.
+                    let data_off =
+                        unsafe { (run.add(KVM_RUN_IO_DATA_OFFSET) as *const u64).read_volatile() };
+                    let data_ptr = unsafe { run.add(data_off as usize) } as *const u8;
                     if size > 8 {
                         return VmExit::UnhandledException((
                             icicle_cpu::ExceptionCode::InternalError,
