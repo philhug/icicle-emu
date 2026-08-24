@@ -88,6 +88,15 @@ pub struct InodeVtable {
     /// Poll the file descriptor, checking whether any of the requested `events` are ready.
     pub poll: fn(inode: &mut Inode, events: u64) -> u64,
 
+    /// Perform a device-specific control operation. `arg` is the raw `ioctl`
+    /// third argument (typically a guest pointer); the inode's device is
+    /// responsible for reading/writing guest memory through it.
+    ///
+    /// ## Errors
+    ///
+    /// - `ENOTTY` if the inode does not implement the requested control.
+    pub ioctl: fn(inode: &mut Inode, request: u64, arg: u64) -> Result<u64>,
+
     /// Receive send a message to a socket.
     pub sendto: fn(inode: &mut Inode, msg: &socket::Message) -> Result<usize>,
 
@@ -142,6 +151,7 @@ pub static DEFAULT_INODE_VTABLE: InodeVtable = InodeVtable {
     read: |_, _, _| Err(errno::EISDIR),
     write: |_, _, _| Err(errno::EISDIR),
     poll: |_, _| 0,
+    ioctl: |_, _, _| Err(errno::ENOTTY),
     recvfrom: |_, _| Err(errno::ENOTSOCK),
     sendto: |_, _| Err(errno::ENOTSOCK),
     bind: |_, _| Err(errno::ENOTSOCK),

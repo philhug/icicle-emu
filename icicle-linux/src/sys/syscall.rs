@@ -1560,24 +1560,10 @@ pub fn arch_prctl_x64<C: LinuxCpu>(ctx: &mut Ctx<C>, code: u64, addr: u64) -> Li
     }
 }
 
-pub fn ioctl<C: LinuxCpu>(ctx: &mut Ctx<C>, fd: u64, request: u64) -> LinuxResult {
-    let _file = ctx.kernel.get_file(fd)?;
-
-    match request {
-        // Get current serial port settings
-        0x5401 => Err(errno::ENOTTY.into()),
-
-        // TIOCGWINSZ
-        0x5413 => Err(errno::ENOTTY.into()),
-
-        // TIOCGPGRP
-        0x540f => Err(errno::ENOSYS.into()),
-
-        // TIOCSPGRP
-        0x5410 => Err(errno::ENOSYS.into()),
-
-        _ => Err(errno::ENOTTY.into()),
-    }
+pub fn ioctl<C: LinuxCpu>(ctx: &mut Ctx<C>, fd: u64, request: u64, arg: u64) -> LinuxResult {
+    let file = ctx.kernel.get_file(fd)?;
+    let result = file.borrow_mut().ioctl(request, arg)?;
+    Ok(result)
 }
 
 pub fn exit<C: LinuxCpu>(ctx: &mut Ctx<C>, status: u64) -> LinuxResult {

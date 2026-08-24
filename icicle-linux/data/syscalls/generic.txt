@@ -28,7 +28,7 @@
 26      inotify_init1                       sys::unimplemented(0)
 27      inotify_add_watch                   sys::unimplemented(0)
 28      inotify_rm_watch                    sys::unimplemented(0)
-29      ioctl                               sys::ioctl(2)
+29      ioctl                               sys::ioctl(3)
 30      ioprio_set                          sys::unimplemented(0)
 31      ioprio_get                          sys::unimplemented(0)
 32      flock                               sys::unimplemented(0)

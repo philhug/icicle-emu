@@ -35,6 +35,10 @@ static DEVICE_VTABLE: InodeVtable = InodeVtable {
         }
         revents
     },
+    ioctl: |inode, request, arg| {
+        let data = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
+        data.ioctl(request, arg)
+    },
     ..DEFAULT_INODE_VTABLE
 };
 
@@ -46,6 +50,10 @@ pub trait Device {
 
     fn write(&mut self, offset: usize, buf: &[u8]) -> Result<usize> {
         Err(errno::EPERM)
+    }
+
+    fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+        Err(errno::ENOTTY)
     }
 
     fn size(&self) -> u64 {
@@ -388,5 +396,50 @@ impl Device for RandomDevice {
 
     fn size(&self) -> u64 {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::InodeIndex;
+
+    /// A device whose ioctl returns request + arg, so the test proves both the
+    /// `request` and the raw `arg` values reach it verbatim.
+    struct EchoDevice;
+
+    impl Device for EchoDevice {
+        fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+            Ok(request.wrapping_add(arg))
+        }
+    }
+
+    #[test]
+    fn device_ioctl_dispatches_request_and_arg() {
+        let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
+        map_device(&mut inode, Box::new(EchoDevice));
+
+        let v = (inode.vtable.ioctl)(&mut inode, 0x10, 0x20).unwrap();
+        assert_eq!(v, 0x30);
+    }
+
+    #[test]
+    fn device_ioctl_preserves_arg_word() {
+        let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
+        map_device(&mut inode, Box::new(EchoDevice));
+
+        // A distinctive high-offset `arg` (a guest pointer) must survive the
+        // dispatch untouched, byte for byte.
+        let v = (inode.vtable.ioctl)(&mut inode, 1, 0xdead_beef_0000_0000).unwrap();
+        assert_eq!(v, 0xdead_beef_0000_0001);
+    }
+
+    #[test]
+    fn default_device_ioctl_is_enotty() {
+        let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
+        map_device(&mut inode, Box::new(NullDevice));
+
+        let err = (inode.vtable.ioctl)(&mut inode, 0, 0).unwrap_err();
+        assert_eq!(err, errno::ENOTTY);
     }
 }

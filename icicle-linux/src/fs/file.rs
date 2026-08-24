@@ -191,6 +191,15 @@ impl ActiveFileData {
         Ok((inode.vtable.poll)(&mut inode, events))
     }
 
+    pub fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+        let mut inode = self.inode.borrow_mut();
+        if inode.hooked {
+            return Err(errno::HOOKED);
+        }
+
+        (inode.vtable.ioctl)(&mut inode, request, arg)
+    }
+
     pub fn iterate_dir(&mut self) -> Result<(Path, InodeRef)> {
         let mut inode = self.inode.borrow_mut();
         if inode.hooked {
