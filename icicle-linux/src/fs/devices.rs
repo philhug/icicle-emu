@@ -56,6 +56,15 @@ pub trait Device {
         Err(errno::ENOTTY)
     }
 
+    /// Map this device into the guest's address space, returning the number of
+    /// bytes the device itself provides (the remainder of the mapping is
+    /// zero-filled by `mmap2`). A device that grants an anonymous writable
+    /// buffer (e.g. `/dev/binder`) returns `Ok(0)`; a device with no mapping
+    /// support returns `Err(EPERM)`.
+    fn mmap(&mut self) -> Result<usize> {
+        Err(errno::EPERM)
+    }
+
     fn size(&self) -> u64 {
         0
     }
@@ -441,5 +450,31 @@ mod tests {
 
         let err = (inode.vtable.ioctl)(&mut inode, 0, 0).unwrap_err();
         assert_eq!(err, errno::ENOTTY);
+    }
+
+    struct MmapGrantDevice;
+
+    impl Device for MmapGrantDevice {
+        fn mmap(&mut self) -> Result<usize> {
+            Ok(0) // anonymous writable grant (binder)
+        }
+    }
+
+    #[test]
+    fn device_mmap_default_is_eperm() {
+        let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
+        map_device(&mut inode, Box::new(NullDevice));
+
+        let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
+        assert_eq!(device.mmap().unwrap_err(), errno::EPERM);
+    }
+
+    #[test]
+    fn device_mmap_grant_returns_zero() {
+        let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
+        map_device(&mut inode, Box::new(MmapGrantDevice));
+
+        let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
+        assert_eq!(device.mmap().unwrap(), 0);
     }
 }

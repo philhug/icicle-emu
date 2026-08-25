@@ -5,7 +5,8 @@ use icicle_cpu::mem::perm;
 
 use crate::{LinuxMmu, ProcessManager, errno, fs::socket, types};
 
-use super::{InodeRef, Path, Result};
+use super::{FileKind, InodeRef, Path, Result};
+use super::devices::Device;
 
 pub type FileDescriptor = u64;
 pub type ActiveFile = Rc<RefCell<ActiveFileData>>;
@@ -218,6 +219,14 @@ impl ActiveFileData {
         let mut inode = self.inode.borrow_mut();
         if inode.hooked {
             return Err(errno::HOOKED);
+        }
+
+        if inode.kind == FileKind::CharacterDevice {
+            // A device maps itself (e.g. a binder buffer is an anonymous
+            // writable grant, not file contents); `mmap2` zero-fills whatever
+            // byte count the device does not supply.
+            let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
+            return device.mmap();
         }
 
         let buf = (inode.vtable.slice)(&mut inode, offset as usize, len as usize)?;
