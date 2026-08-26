@@ -1562,7 +1562,9 @@ pub fn arch_prctl_x64<C: LinuxCpu>(ctx: &mut Ctx<C>, code: u64, addr: u64) -> Li
 
 pub fn ioctl<C: LinuxCpu>(ctx: &mut Ctx<C>, fd: u64, request: u64, arg: u64) -> LinuxResult {
     let file = ctx.kernel.get_file(fd)?;
-    let result = file.borrow_mut().ioctl(request, arg)?;
+    // The value is hoisted into a local so the file's RefCell borrow ends
+    // before the Errno -> LinuxError coercion `?` performs.
+    let result = file.borrow_mut().ioctl(request, arg, ctx.cpu.mem())?;
     Ok(result)
 }
 

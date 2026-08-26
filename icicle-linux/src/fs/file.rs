@@ -192,13 +192,13 @@ impl ActiveFileData {
         Ok((inode.vtable.poll)(&mut inode, events))
     }
 
-    pub fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+    pub fn ioctl(&mut self, request: u64, arg: u64, mem: &mut dyn LinuxMmu) -> Result<u64> {
         let mut inode = self.inode.borrow_mut();
         if inode.hooked {
             return Err(errno::HOOKED);
         }
 
-        (inode.vtable.ioctl)(&mut inode, request, arg)
+        (inode.vtable.ioctl)(&mut inode, request, arg, mem)
     }
 
     pub fn iterate_dir(&mut self) -> Result<(Path, InodeRef)> {
@@ -224,9 +224,11 @@ impl ActiveFileData {
         if inode.kind == FileKind::CharacterDevice {
             // A device maps itself (e.g. a binder buffer is an anonymous
             // writable grant, not file contents); `mmap2` zero-fills whatever
-            // byte count the device does not supply.
+            // byte count the device does not supply. The kernel hands the
+            // device the address the mapping landed at, because a driver whose
+            // buffers live inside the granted range must know where it is.
             let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
-            return device.mmap();
+            return device.mmap(mem, virt_addr, len);
         }
 
         let buf = (inode.vtable.slice)(&mut inode, offset as usize, len as usize)?;

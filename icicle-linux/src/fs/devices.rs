@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use icicle_cpu::utils::XorShiftRng;
 
-use crate::{errno, sys};
+use crate::{LinuxMmu, errno, sys};
 
 use super::{DEFAULT_INODE_VTABLE, FileKind, Inode, InodeVtable, Result};
 
@@ -35,9 +35,9 @@ static DEVICE_VTABLE: InodeVtable = InodeVtable {
         }
         revents
     },
-    ioctl: |inode, request, arg| {
+    ioctl: |inode, request, arg, mem| {
         let data = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
-        data.ioctl(request, arg)
+        data.ioctl(request, arg, mem)
     },
     ..DEFAULT_INODE_VTABLE
 };
@@ -52,16 +52,21 @@ pub trait Device {
         Err(errno::EPERM)
     }
 
-    fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+    /// `arg` is the ioctl's third argument, typically a guest pointer into
+    /// memory the device reaches through `mem` (the same copy_from_user/
+    /// copy_to_user a real kernel driver does).
+    fn ioctl(&mut self, request: u64, arg: u64, mem: &mut dyn LinuxMmu) -> Result<u64> {
         Err(errno::ENOTTY)
     }
 
-    /// Map this device into the guest's address space, returning the number of
-    /// bytes the device itself provides (the remainder of the mapping is
-    /// zero-filled by `mmap2`). A device that grants an anonymous writable
-    /// buffer (e.g. `/dev/binder`) returns `Ok(0)`; a device with no mapping
-    /// support returns `Err(EPERM)`.
-    fn mmap(&mut self) -> Result<usize> {
+    /// Map this device into the guest's address space. The kernel has already
+    /// placed the mapping at `addr` (`len` bytes) and hands both to the
+    /// device, because a driver whose buffers live inside the granted range
+    /// (e.g. `/dev/binder`) must know where it landed. Returns the number of
+    /// bytes the device itself supplies; `mmap2` zero-fills the remainder. A
+    /// device granting an anonymous writable buffer records the range and
+    /// returns `Ok(0)`; a device with no mapping support returns `Err(EPERM)`.
+    fn mmap(&mut self, mem: &mut dyn LinuxMmu, addr: u64, len: u64) -> Result<usize> {
         Err(errno::EPERM)
     }
 
@@ -412,13 +417,14 @@ impl Device for RandomDevice {
 mod tests {
     use super::*;
     use crate::fs::InodeIndex;
+    use icicle_cpu::mem::Mmu;
 
     /// A device whose ioctl returns request + arg, so the test proves both the
     /// `request` and the raw `arg` values reach it verbatim.
     struct EchoDevice;
 
     impl Device for EchoDevice {
-        fn ioctl(&mut self, request: u64, arg: u64) -> Result<u64> {
+        fn ioctl(&mut self, request: u64, arg: u64, _mem: &mut dyn LinuxMmu) -> Result<u64> {
             Ok(request.wrapping_add(arg))
         }
     }
@@ -428,7 +434,7 @@ mod tests {
         let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
         map_device(&mut inode, Box::new(EchoDevice));
 
-        let v = (inode.vtable.ioctl)(&mut inode, 0x10, 0x20).unwrap();
+        let v = (inode.vtable.ioctl)(&mut inode, 0x10, 0x20, &mut Mmu::new()).unwrap();
         assert_eq!(v, 0x30);
     }
 
@@ -439,7 +445,8 @@ mod tests {
 
         // A distinctive high-offset `arg` (a guest pointer) must survive the
         // dispatch untouched, byte for byte.
-        let v = (inode.vtable.ioctl)(&mut inode, 1, 0xdead_beef_0000_0000).unwrap();
+        let v = (inode.vtable.ioctl)(&mut inode, 1, 0xdead_beef_0000_0000, &mut Mmu::new())
+            .unwrap();
         assert_eq!(v, 0xdead_beef_0000_0001);
     }
 
@@ -448,14 +455,17 @@ mod tests {
         let mut inode = Inode::new(InodeIndex { dev: 0, ino: 0 });
         map_device(&mut inode, Box::new(NullDevice));
 
-        let err = (inode.vtable.ioctl)(&mut inode, 0, 0).unwrap_err();
+        let err = (inode.vtable.ioctl)(&mut inode, 0, 0, &mut Mmu::new()).unwrap_err();
         assert_eq!(err, errno::ENOTTY);
     }
 
     struct MmapGrantDevice;
 
     impl Device for MmapGrantDevice {
-        fn mmap(&mut self) -> Result<usize> {
+        fn mmap(&mut self, mem: &mut dyn LinuxMmu, addr: u64, len: u64) -> Result<usize> {
+            // A real granting device records the (addr, len) range; the test
+            // mapping stays anonymous and untouched.
+            let _ = (mem, addr, len);
             Ok(0) // anonymous writable grant (binder)
         }
     }
@@ -466,7 +476,7 @@ mod tests {
         map_device(&mut inode, Box::new(NullDevice));
 
         let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
-        assert_eq!(device.mmap().unwrap_err(), errno::EPERM);
+        assert_eq!(device.mmap(&mut Mmu::new(), 0, 0).unwrap_err(), errno::EPERM);
     }
 
     #[test]
@@ -475,6 +485,6 @@ mod tests {
         map_device(&mut inode, Box::new(MmapGrantDevice));
 
         let device = inode.data.downcast_mut::<Box<dyn Device>>().unwrap();
-        assert_eq!(device.mmap().unwrap(), 0);
+        assert_eq!(device.mmap(&mut Mmu::new(), 0x1000, 0x1000).unwrap(), 0);
     }
 }
