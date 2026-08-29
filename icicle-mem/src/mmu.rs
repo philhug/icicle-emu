@@ -15,6 +15,41 @@ pub const DETECT_SELF_MODIFYING_CODE: bool = false;
 pub const ENABLE_ZERO_PAGE_OPTIMIZATION: bool = true;
 pub const ENABLE_MEMORY_HOOKS: bool = true;
 
+/// A guest address-translation hook, installed on an [`Mmu`] to translate
+/// virtual addresses that miss the TLB by walking guest page tables instead of
+/// falling back to the flat virtual mapping.
+///
+/// The hook is consulted on every TLB miss while installed. When it returns
+/// `Some(pa)`, the page containing `pa` is backed by the (flat, identity
+/// mapped) physical RAM window and remapped at the page containing `va`, after
+/// which the regular TLB-miss path resolves the access. When it returns `None`
+/// (or when no hook is installed), behavior is unchanged: the flat `mapping`
+/// range map handles the address, usually faulting for addresses that only
+/// exist in the page tables.
+///
+/// The JIT hot path (TLB hit) is untouched: this seam only runs on misses.
+pub trait AddressTranslator {
+    /// Translate `va` to a guest physical address, or `None` if no mapping
+    /// exists (the caller then falls back to the flat mapping).
+    ///
+    /// `mem` may be used to read guest memory (e.g. page-table entries)
+    /// during the walk: the translator is detached from the `Mmu` for the
+    /// duration of this call, so recursive lookups on `mem` resolve through
+    /// the flat mapping and cannot re-enter the walk.
+    fn translate(&mut self, mem: &mut Mmu, va: u64, perm: u8) -> Option<u64>;
+
+    /// Notifies the translator that a guest control register it walks with has
+    /// changed. `reg` is an opaque arch-specific key (the ARMv7 walker in
+    /// `fast-core` uses the `fast_cp15_*` varnode suffixes). Default: no-op.
+    fn on_reg_change(&mut self, reg: &str, value: u64) {
+        let _ = (reg, value);
+    }
+
+    /// Invalidates any guest-translation state cached by the walker (an
+    /// architectural TLB or page-table cache). Default: no-op.
+    fn flush(&mut self) {}
+}
+
 pub trait ReadHook {
     fn read(&mut self, mem: &mut Mmu, addr: u64, size: u8) -> Option<u64>;
 }
@@ -193,6 +228,10 @@ pub struct Mmu {
     /// same address, we keep track of the last IO handler used and check if it matches the address
     /// before doing a search for the region.
     last_io_handler: Option<(u64, u64, IoHandler)>,
+
+    /// Guest address-translation hook consulted on TLB misses when installed
+    /// (see [`AddressTranslator`]).
+    translator: Option<Box<dyn AddressTranslator>>,
 }
 
 impl crate::Resettable for Mmu {
@@ -233,6 +272,33 @@ impl Mmu {
             read_after_hooks: HookStore::new(),
             write_hooks: HookStore::new(),
             last_io_handler: None,
+            translator: None,
+        }
+    }
+
+    /// Installs (or, with `None`, removes) the guest address-translation hook
+    /// consulted on TLB misses. Installing one flushes the TLB, since existing
+    /// entries may have been populated by a previous translation scheme.
+    pub fn set_translator(&mut self, translator: Option<Box<dyn AddressTranslator>>) {
+        self.translator = translator;
+        self.tlb.clear();
+    }
+
+    /// Forwards a guest control-register change to the installed translator (if
+    /// any), so a page-table walker can keep its view of TTBR/TTBCR/DACR/SCTLR
+    /// current without re-reading pcode register state (to which it has no
+    /// access from inside a translate call).
+    pub fn translator_update(&mut self, reg: &str, value: u64) {
+        if let Some(t) = self.translator.as_mut() {
+            t.on_reg_change(reg, value);
+        }
+    }
+
+    /// Requests that the installed translator (if any) drop its cached
+    /// guest-translation state, e.g. after a snapshot restore.
+    pub fn translator_flush(&mut self) {
+        if let Some(t) = self.translator.as_mut() {
+            t.flush();
         }
     }
 
@@ -1159,6 +1225,61 @@ impl Mmu {
         Ok(())
     }
 
+    /// If a translator is installed, asks it for the physical address backing
+    /// `va` and maps that page into the flat virtual mapping so the regular
+    /// TLB-miss path (which follows) can resolve it. Nothing happens when no
+    /// translator is installed, or when the walk fails: the flat mapping then
+    /// handles `va` as before, usually faulting for addresses that only exist
+    /// in the guest page tables.
+    fn apply_translation(&mut self, va: u64, perm: u8) {
+        let Some(mut translator) = self.translator.take() else {
+            return;
+        };
+        // The translator is detached while it runs, so its own guest-memory
+        // reads (page-table fetches) resolve through the flat mapping instead
+        // of recursing into this walk.
+        let translated = translator.translate(self, va, perm);
+        self.translator = Some(translator);
+        if let Some(pa) = translated {
+            self.map_translated(va, pa);
+        }
+    }
+
+    /// Maps the page containing guest physical `pa` at the page containing
+    /// `va`, returning whether the mapping was established.
+    ///
+    /// This works by re-entering the flat virtual mapping with `pa == va`:
+    /// the page backing `pa` is found (initializing it first if the guest has
+    /// never touched it) through the identity-mapped RAM window, and is then
+    /// remapped at the translated page. It is correct while RAM stays
+    /// identity-mapped, which is the ARMv7 early-boot window this seam is
+    /// designed for; a dedicated guest-physical-address space is the
+    /// follow-up once the kernel tears the identity map down.
+    fn map_translated(&mut self, va: u64, pa: u64) -> bool {
+        let pa_page = self.page_aligned(pa);
+        let va_page = self.page_aligned(va);
+
+        let index = match self.get_physical_index(pa_page) {
+            Some(index) => index,
+            // The guest has never touched this PA: materialize a real page for
+            // it (writable, never the zero page) so the mapped VA is regular
+            // RAM rather than an unmapped or read-only alias.
+            None => match self.init_physical(pa_page, true) {
+                Some(index) => index,
+                None => return false,
+            },
+        };
+
+        let already = matches!(
+            self.mapping.get(va_page),
+            Some(MemoryMapping::Physical(m)) if m.index == index
+        );
+        if !already {
+            self.map_physical(va_page, index);
+        }
+        true
+    }
+
     #[cold]
     pub fn read_tlb_miss<const N: usize>(&mut self, addr: u64, perm: u8) -> MemResult<[u8; N]> {
         if !physical::is_aligned::<N>(addr) {
@@ -1200,6 +1321,7 @@ impl Mmu {
             _ => {
                 tracing::trace!("read_tlb_miss: {:#0x}", self.page_aligned(addr));
                 self.tlb_miss_count += 1;
+                self.apply_translation(addr, perm);
                 match self.mapping.get_with_range(addr).ok_or(MemError::Unmapped)? {
                     (_, _, MemoryMapping::Physical(entry)) => {
                         self.read_physical(entry.index, addr, perm)
@@ -1248,6 +1370,7 @@ impl Mmu {
 
         tracing::trace!("write_tlb_miss: {:#0x}", self.page_aligned(addr));
         self.tlb_miss_count += 1;
+        self.apply_translation(addr, perm);
         let result = match self.mapping.get(addr).ok_or(MemError::Unmapped)? {
             MemoryMapping::Physical(entry) => self.write_physical(entry.index, addr, value, perm),
             &MemoryMapping::Unallocated(entry) => {

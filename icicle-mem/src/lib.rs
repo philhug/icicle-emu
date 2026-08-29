@@ -16,7 +16,7 @@ use crate::range_map::RangeMap;
 pub const UNINIT_VALUE: u8 = 0xaa;
 
 pub use crate::{
-    mmu::{Mmu, ReadAfterHook, ReadHook, WriteHook},
+    mmu::{AddressTranslator, Mmu, ReadAfterHook, ReadHook, WriteHook},
     perm::{MemError, MemResult},
 };
 
