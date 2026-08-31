@@ -334,9 +334,16 @@ impl<'a, 'b> Builder<'a, 'b> {
             // Unconstrained
             pcode::Op::Load(pcode::REGISTER_SPACE) | pcode::Op::Store(pcode::REGISTER_SPACE) => {}
 
-            // input[0] (address): ptr
-            pcode::Op::Load(_) | pcode::Op::Store(_) => {
-                self.set_size(&mut inputs[0], self.pointer_size);
+            // input[0] (address): ptr sized by the target space. A multi-space
+            // language (e.g. AVR8: 16-bit data space, 4-byte code space) needs
+            // each space's own address width; one global pointer size cannot
+            // serve both (see the AVR bring-up in fast-ext/pkg/avr).
+            pcode::Op::Load(id) | pcode::Op::Store(id) => {
+                if let Some(size) = self.space_size(id) {
+                    self.set_size(&mut inputs[0], size);
+                } else {
+                    self.set_size(&mut inputs[0], self.pointer_size);
+                }
             }
 
             // input[0] (condition): bool, input[1] (destination): ptr
@@ -465,6 +472,17 @@ impl<'a, 'b> Builder<'a, 'b> {
 
     fn size_of(&self, value: Value) -> Option<ValueSize> {
         value.size.or_else(|| self.scope.size_of(value.local))
+    }
+
+    /// The address width (bytes) of a pcode space, for sizing load/store
+    /// address operands against the space they target.
+    fn space_size(&self, id: pcode::MemId) -> Option<ValueSize> {
+        self.scope
+            .globals
+            .spaces
+            .iter()
+            .find(|s| s.space_id == id)
+            .map(|s| s.size)
     }
 
     /// Set the size of a value. An error is set the value already has a fixed size that is not the

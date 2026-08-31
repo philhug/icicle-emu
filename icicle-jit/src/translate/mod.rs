@@ -287,6 +287,10 @@ pub(crate) struct TranslatorCtx {
     pub reload_after_mem: bool,
     /// Configures whether calls to push/pop shadow-stack are injected in the JIT.
     pub enable_shadow_stack: bool,
+    /// Wordsize of the default space; RAM_SPACE load/store design addresses
+    /// are scaled by this factor (AVR8 code space: 2). See
+    /// SleightData::default_space_wordsize.
+    pub ram_space_wordsize: u64,
     page_size: u64,
     reg_pc: pcode::VarNode,
     endianness: Endianness,
@@ -304,6 +308,7 @@ impl TranslatorCtx {
         };
 
         Self {
+            ram_space_wordsize: arch.sleigh.default_space_wordsize as u64,
             reg_pc: arch.reg_pc,
             disable_jit_mem: false,
             disable_jit_reg: false,

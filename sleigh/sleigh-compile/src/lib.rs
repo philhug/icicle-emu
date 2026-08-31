@@ -59,6 +59,10 @@ pub fn build_inner(mut parser: Parser, verbose: bool) -> Result<SleighData, Stri
 
     ctx.data.default_space_size =
         symbols.default_space.map(|i| symbols.spaces[i as usize].size).unwrap_or(8);
+    ctx.data.default_space_wordsize = symbols
+        .default_space
+        .map(|i| symbols.spaces[i as usize].word_size)
+        .unwrap_or(1);
 
     for entry in &symbols.context_fields {
         let name_str = symbols.parser.get_ident_str(entry.name);

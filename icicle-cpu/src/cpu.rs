@@ -679,12 +679,15 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
 
     fn load_mem<const N: usize>(&mut self, id: pcode::MemId, addr: u64) -> Option<[u8; N]> {
         match id {
-            pcode::RAM_SPACE => match self.cpu.mem.read::<N>(addr, perm::READ) {
+            pcode::RAM_SPACE => {
+                let ws = self.cpu.arch.sleigh.default_space_wordsize as u64;
+                match self.cpu.mem.read::<N>(addr.wrapping_mul(ws), perm::READ) {
                 Ok(val) => Some(val),
                 Err(err) => {
                     self.exception(ExceptionCode::from_load_error(err), addr);
                     return None;
                 }
+            }
             },
             pcode::REGISTER_SPACE => {
                 let Some(var) = self.cpu.var_for_offset(addr as u32, N as u8)
@@ -729,7 +732,8 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
     ) -> Option<()> {
         match id {
             pcode::RAM_SPACE => {
-                if let Err(err) = self.cpu.mem.write(addr, value, perm::WRITE) {
+                let ws = self.cpu.arch.sleigh.default_space_wordsize as u64;
+                if let Err(err) = self.cpu.mem.write(addr.wrapping_mul(ws), value, perm::WRITE) {
                     self.exception(ExceptionCode::from_store_error(err), addr);
                     return None;
                 }

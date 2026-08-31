@@ -498,6 +498,11 @@ pub struct SleighData {
     pub debug_info: DebugInfo,
 
     pub default_space_size: u16,
+    /// The wordsize (bytes per addressable unit) of the default space. The
+    /// fetch path and RAM_SPACE load/store paths scale design addresses by
+    /// this factor when it is > 1, realizing the Ghidra codebyte overlay for
+    /// word-addressable code spaces (e.g. AVR8, wordsize 2).
+    pub default_space_wordsize: u16,
     pub alignment: u16,
     pub big_endian: bool,
 }

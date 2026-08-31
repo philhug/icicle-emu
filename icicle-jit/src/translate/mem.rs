@@ -237,6 +237,12 @@ pub(super) fn load_ram(trans: &mut Translator, guest_addr: pcode::Value, output:
     }
 
     let guest_addr_val = trans.read_zxt(guest_addr, 8);
+    let guest_addr_val = if trans.ctx.ram_space_wordsize != 1 {
+        let ws = trans.builder.ins().iconst(types::I64, trans.ctx.ram_space_wordsize as i64);
+        trans.builder.ins().imul(guest_addr_val, ws)
+    } else {
+        guest_addr_val
+    };
 
     if trans.ctx.disable_jit_mem {
         let value = load_fallback(trans, output, guest_addr_val);
@@ -346,6 +352,12 @@ pub(super) fn store_ram(trans: &mut Translator, guest_addr: pcode::Value, value:
     }
 
     let guest_addr_val = trans.read_zxt(guest_addr, 8);
+    let guest_addr_val = if trans.ctx.ram_space_wordsize != 1 {
+        let ws = trans.builder.ins().iconst(types::I64, trans.ctx.ram_space_wordsize as i64);
+        trans.builder.ins().imul(guest_addr_val, ws)
+    } else {
+        guest_addr_val
+    };
     let store_size = value.size();
     let value = trans.read_int(value);
 
