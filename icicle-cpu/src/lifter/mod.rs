@@ -28,7 +28,11 @@ impl InstructionSource for crate::Cpu {
     }
 
     fn read_bytes(&mut self, vaddr: u64, buf: &mut [u8]) {
-        let _ = self.mem.read_bytes(vaddr, buf, icicle_mem::perm::NONE);
+        // A word-addressable default (code) space stores its bytes at
+        // design address * wordsize (the Ghidra codebyte overlay); the
+        // fetch address is the PC value, which lives in design units.
+        let ws = self.arch.sleigh.default_space_wordsize as u64;
+        let _ = self.mem.read_bytes(vaddr.wrapping_mul(ws), buf, icicle_mem::perm::NONE);
     }
 
     fn ensure_exec(&mut self, vaddr: u64, len: usize) -> bool {
