@@ -85,6 +85,12 @@ impl InstructionLifter {
         self.decoder.global_context = context;
     }
 
+    /// Drop all decoder-side future context modifications. See
+    /// [`sleigh_runtime::Decoder::clear_future_context_mods`].
+    pub fn clear_future_context_mods(&mut self) {
+        self.decoder.clear_future_context_mods();
+    }
+
     /// Lift a single instruction starting at `vaddr` returning the address of the next instruction,
     /// or `None` if no instruction could be fetched from `vaddr`.
     pub fn lift<S>(&mut self, src: &mut S, vaddr: u64) -> Result<u64, DecodeError>
@@ -448,6 +454,12 @@ impl BlockLifter {
 
     pub fn set_context(&mut self, context: u64) {
         self.instruction_lifter.set_context(context);
+    }
+
+    /// Drop all decoder-side future context modifications. See
+    /// [`sleigh_runtime::Decoder::clear_future_context_mods`].
+    pub fn clear_future_context_mods(&mut self) {
+        self.instruction_lifter.clear_future_context_mods();
     }
 
     pub fn mark_as_temporary(&mut self, var_id: pcode::VarId) {

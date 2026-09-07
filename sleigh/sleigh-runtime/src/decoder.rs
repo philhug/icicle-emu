@@ -93,6 +93,24 @@ impl Decoder {
         self.bytes.extend_from_slice(bytes);
     }
 
+    /// Drop all recorded future context modifications.
+    ///
+    /// Entries in `future_context_mods` are recorded while decoding instructions
+    /// (e.g. an ARM `globalset(<target>, TMode)` emitted by a Thumb `blx` pointing
+    /// at an ARM trampoline) and are keyed by the **target address**. When code is
+    /// reloaded out-of-band at the same addresses (firmware stage chains that
+    /// unpack every stage over the previous image), the recorded modifications
+    /// describe bytes that no longer exist and silently poison subsequent decodes
+    /// at those addresses.
+    ///
+    /// During execution the ISA-mode register (updated by the branch semantics
+    /// themselves) is the authoritative source of decode mode at a block entry,
+    /// so clearing the map cannot mis-decode live control flow; entries are
+    /// re-recorded whenever the recording instructions are lifted again.
+    pub fn clear_future_context_mods(&mut self) {
+        self.future_context_mods.clear();
+    }
+
     /// Decode the current instruction storing the result in `inst`.
     pub fn decode_into(&mut self, sleigh: &SleighData, inst: &mut Instruction) -> Option<()> {
         self.is_valid = true;
