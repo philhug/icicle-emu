@@ -591,7 +591,7 @@ impl Mmu {
 
                     let page = physical.get_mut(entry.index);
                     if page.executed {
-                        tracing::error!("Changed perms of code page. JIT cache may now be invalid");
+                        tracing::warn!("Changed perms of code page. JIT cache may now be invalid");
                     }
                     page.data_mut().perm[offset..offset + len].fill(perm);
                 }
