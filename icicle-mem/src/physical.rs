@@ -373,6 +373,46 @@ impl PageData {
         }
     }
 
+    /// Clear the given permission bits over a range by `and`-ing their complement into the
+    /// existing value.
+    ///
+    /// # Safety
+    ///
+    /// The range `offset .. offset + len` must be entirely in-bounds.
+    #[inline]
+    pub unsafe fn clear_perm_unchecked(&mut self, offset: usize, len: usize, perm: u8) {
+        #[cold]
+        #[inline(never)]
+        unsafe fn slow(data: &mut PageData, offset: usize, len: usize, perm: u8) {
+            for byte in data.perm.get_unchecked_mut(offset..offset + len) {
+                *byte &= !perm
+            }
+        }
+        let mask = !perm;
+        let perm_ptr = self.perm.as_mut_ptr();
+        match len {
+            1 => {
+                *perm_ptr.add(offset) &= mask;
+            }
+            2 => {
+                let ptr = perm_ptr.add(offset).cast::<u16>();
+                let old = ptr.read_unaligned();
+                ptr.write_unaligned(old & u16::from_le_bytes([mask; 2]));
+            }
+            4 => {
+                let ptr = perm_ptr.add(offset).cast::<u32>();
+                let old = ptr.read_unaligned();
+                ptr.write_unaligned(old & u32::from_le_bytes([mask; 4]));
+            }
+            8 => {
+                let ptr = perm_ptr.add(offset).cast::<u64>();
+                let old = ptr.read_unaligned();
+                ptr.write_unaligned(old & u64::from_le_bytes([mask; 8]));
+            }
+            _ => slow(self, offset, len, perm),
+        }
+    }
+
     /// Computes the offset within the page and the length of the memory region between `start` and
     /// `end`, checking that region is in bounds.
     #[inline(always)]

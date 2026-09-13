@@ -11,7 +11,7 @@ use crate::{
     tlb,
 };
 
-pub const DETECT_SELF_MODIFYING_CODE: bool = true;
+pub const DETECT_SELF_MODIFYING_CODE: bool = false;
 pub const ENABLE_ZERO_PAGE_OPTIMIZATION: bool = true;
 pub const ENABLE_MEMORY_HOOKS: bool = true;
 
@@ -158,6 +158,12 @@ pub struct Mmu {
     /// cleared.
     pub modified: HashSet<u64>,
 
+    /// Guest-visible code-page writes pending VM-level invalidation: `(start, end)` ranges written
+    /// over executed code since the last drain. The VM drains this before serving any lifted block
+    /// and drops the overlapping translations (fast lookup, lifted groups, disasm and recorded
+    /// decode-mode globalsets).
+    pub code_writes: Vec<(u64, u64)>,
+
     /// The translation lookahead buffer for the MMU.
     ///
     /// Note: care needs to be taken to ensure that the relevant entries in this cache are cleared
@@ -216,6 +222,7 @@ impl Mmu {
             mapping_changed: false,
             address_mask,
             modified: HashSet::new(),
+            code_writes: Vec::new(),
             tlb: Box::new(tlb::TranslationCache::new()),
             mapping: RangeMap::new(),
             physical: physical::PhysicalMemory::new(physical::MAX_PAGES),
@@ -620,8 +627,20 @@ impl Mmu {
                 MemoryMapping::Physical(entry) => {
                     tlb.remove_range(start, len);
                     let page = physical.get_mut(entry.index);
-                    if page.executed && self.detect_self_modifying_code {
-                        check_self_modifying_memset(page.data(), start, len, value)?;
+                    if page.executed {
+                        if self.detect_self_modifying_code {
+                            check_self_modifying_memset(page.data(), start, len, value)?;
+                        } else {
+                            self.code_writes.push((start, start + len));
+                            let offset = PageData::offset(start);
+                            unsafe {
+                                page.write_ptr().ptr.as_mut().clear_perm_unchecked(
+                                    offset,
+                                    len as usize,
+                                    perm::IN_CODE_CACHE,
+                                );
+                            };
+                        }
                     }
 
                     let offset = PageData::offset(start);
@@ -826,20 +845,17 @@ impl Mmu {
                         unsafe { page.write_ptr().ptr.as_mut().get_perm_unchecked(offset, len) };
                     perm::check(perm, perm::INIT | perm::EXEC)?;
 
-                    // Mark the page as executed
+                    // Mark the page as executed, and tag the executed bytes as code so the
+                    // write path can recognize a code-page write and invalidate the
+                    // translations instead of treating it as a fault.
                     page.executed = true;
-
-                    // Prevent writes to the region we are executing (we don't currently support
-                    // self modifying code).
-                    if self.detect_self_modifying_code {
-                        unsafe {
-                            page.write_ptr().ptr.as_mut().add_perm_unchecked(
-                                offset,
-                                len,
-                                perm::IN_CODE_CACHE,
-                            );
-                        };
-                    }
+                    unsafe {
+                        page.write_ptr().ptr.as_mut().add_perm_unchecked(
+                            offset,
+                            len,
+                            perm::IN_CODE_CACHE,
+                        );
+                    };
 
                     tlb.remove_write(mapping.addr);
                     Ok(())
@@ -1051,8 +1067,27 @@ impl Mmu {
         let page_size = self.page_size();
 
         let mut page = self.physical.get_mut(index);
-        if page.executed && self.detect_self_modifying_code {
-            check_self_modifying_write(page.data(), addr, &value)?;
+        if page.executed {
+            if self.detect_self_modifying_code {
+                // Diagnostic mode: refuse, and let the host see the policy
+                // violation instead of silently accepting a code overwrite.
+                check_self_modifying_write(page.data(), addr, &value)?;
+            } else if writes_code_bytes(page.data(), addr, &value) {
+                // Default: a write over executed code invalidates the affected
+                // translations instead of failing. Record the guest range so
+                // the VM drops the lifted blocks, and clear the code-cache
+                // marker over the written bytes: they are data now, and a
+                // later fetch re-marks them as code before re-lifting.
+                self.code_writes.push((addr, addr + N as u64));
+                let offset = PageData::offset(addr);
+                unsafe {
+                    page.write_ptr().ptr.as_mut().clear_perm_unchecked(
+                        offset,
+                        N,
+                        perm::IN_CODE_CACHE,
+                    );
+                };
+            }
         }
 
         if page.copy_on_write {
@@ -1084,10 +1119,17 @@ impl Mmu {
         page.modified = true;
         page.data_mut().write(addr, value, perm)?;
 
-        let uncachable = self.write_hooks.contains_address(addr, page_size);
-        if !uncachable {
-            // Safety: `page.data_mut()` ensures the page is a unique copy of the underlying data.
-            self.tlb.insert_write(page_start, unsafe { page.write_ptr() });
+        // Never cache a write entry for executed pages: the SMC/auto-invalidate
+        // path must see every store to code (each store re-checks `executed` in
+        // `write_physical`). Caching the entry would let later stores bypass it.
+        if page.executed {
+            self.tlb.remove_write(page_start);
+        } else {
+            let uncachable = self.write_hooks.contains_address(addr, page_size);
+            if !uncachable {
+                // Safety: `page.data_mut()` ensures the page is a unique copy of the underlying data.
+                self.tlb.insert_write(page_start, unsafe { page.write_ptr() });
+            }
         }
 
         Ok(())
@@ -1281,6 +1323,19 @@ fn check_self_modifying_memset(page: &PageData, start: u64, len: u64, value: u8)
         }
     }
     Ok(())
+}
+
+/// Whether the write would change bytes currently marked as executed code.
+/// The build-up is deliberately the same as `check_self_modifying_write`:
+/// code-page detection should agree across the diagnostic and the
+/// auto-invalidating path.
+fn writes_code_bytes(page: &PageData, addr: u64, value: &[u8]) -> bool {
+    let offset = PageData::offset(addr);
+    page.data[offset..]
+        .iter()
+        .zip(&page.perm[offset..])
+        .zip(value)
+        .any(|((old, perm), new)| perm & perm::IN_CODE_CACHE != 0 && *old != *new)
 }
 
 #[cold]

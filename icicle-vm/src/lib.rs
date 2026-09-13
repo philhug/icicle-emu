@@ -202,6 +202,9 @@ impl Vm {
 
         self.update_timer();
         loop {
+            // Retire any translations a guest store to executed code made stale.
+            self.flush_code_writes();
+
             if let Some(exception) = self.cpu.pending_exception.take() {
                 self.cpu.exception = exception;
                 match self.handle_exception() {
@@ -246,6 +249,11 @@ impl Vm {
 
     /// Run on the host natively through KVM. Delegates to the kvm engine.
     fn run_kvm(&mut self) -> VmExit {
+        // Writes under KVM go straight to the guest pages (memslots), so the
+        // mmu's SMC path is bypassed; the JIT is not used either. Nothing to
+        // invalidate here — code served to KVM is re-fetched by the hardware.
+        self.flush_code_writes();
+
         // Lazy construction: the engine is created the first time the VM runs
         // with `Backend::Kvm`, then reused across `run()` calls (copy-in/out
         // each time keeps the paged `Mmu` and the memslot buffer in sync).
@@ -427,6 +435,7 @@ impl Vm {
         self.cpu.write_pc(addr);
 
         let key = self.get_block_key(addr);
+        self.flush_code_writes();
         match self.code.map.get(&key) {
             Some(group) => {
                 self.cpu.block_id = group.blocks.0 as u64;
@@ -523,6 +532,8 @@ impl Vm {
     fn run_block_interpreter(&mut self) {
         self.cpu.exception.clear();
 
+        self.flush_code_writes();
+
         let (mut block_id, mut offset) = match self.get_current_block() {
             Some(value) => value,
             None => {
@@ -581,6 +592,8 @@ impl Vm {
                 Target::External(addr) => {
                     let addr: u64 = self.cpu.read_dynamic(addr).zxt();
                     self.cpu.write_pc(addr);
+
+                    self.flush_code_writes();
 
                     match self.code.map.get(&self.get_block_key(addr)) {
                         Some(group) => {
@@ -664,6 +677,10 @@ impl Vm {
             print_jit_enter(self, next_addr);
         }
         while self.cpu.exception.code == ExceptionCode::None as u32 {
+            // A store to executed code in the previous block must not be served
+            // by a stale translation on the next block lookup.
+            self.flush_code_writes();
+
             let jit_func = match self.jit.lookup_fast(next_addr) {
                 Some(func) => {
                     self.jit.jit_hit += 1;
@@ -711,6 +728,67 @@ impl Vm {
                 Some((id as u64, 0))
             }
         }
+    }
+
+    /// Drop the translations a code-page write invalidated, and retire the
+    /// recorded decode-mode globalsets (an ARM Thumb `blx` records `TMode` at
+    /// its target; a same-base reload must not decode the new image with the
+    /// old image's mode).
+    ///
+    /// Runs whenever a block is about to be served, but the `code_writes` queue
+    /// is emptied first, so the check is a single empty test on the fast path.
+    pub fn flush_code_writes(&mut self) {
+        let writes = std::mem::take(&mut self.cpu.mem.code_writes);
+        if writes.is_empty() {
+            return;
+        }
+
+        let mut stale_groups: Vec<BlockKey> = Vec::new();
+        let mut stale_blocks: std::collections::BTreeSet<usize> = Default::default();
+        let mut hit_current = false;
+        for (range_start, range_end) in writes {
+            // The interpreter serves the *current* block by id, so a store over
+            // the block we are positioned in must drop that position too: reset
+            // to `MAX` so the next fetch re-lifts from the new bytes.
+            if let Some(id) = self.code.blocks.get(self.cpu.block_id as usize) {
+                if id.start < range_end && range_start < id.end {
+                    hit_current = true;
+                }
+            }
+            for (&key, group) in &self.code.map {
+                let overlaps = self.code.blocks[group.range()].iter().any(|block| {
+                    block.start < range_end && range_start < block.end
+                });
+                if overlaps {
+                    stale_groups.push(key);
+                    stale_blocks.extend(group.range());
+                }
+            }
+            // Cached disassembly over the range describes bytes that no longer exist.
+            let kill: Vec<u64> = self
+                .code
+                .disasm
+                .keys()
+                .copied()
+                .filter(|&a| a >= range_start && a < range_end)
+                .collect();
+            for a in kill {
+                self.code.disasm.remove(&a);
+            }
+        }
+
+        for key in stale_groups {
+            self.code.map.remove(&key);
+        }
+        for id in stale_blocks {
+            self.code.modified.insert(id);
+            self.jit.invalidate(id);
+        }
+        if hit_current {
+            self.cpu.block_id = u64::MAX;
+            self.cpu.block_offset = 0;
+        }
+        self.lifter.clear_future_context_mods();
     }
 
     pub fn reset(&mut self) {

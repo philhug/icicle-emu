@@ -37,6 +37,47 @@ fn write_pages() {
 }
 
 #[test]
+fn store_over_executed_code_records_invalidation() {
+    let mut mmu = Mmu::default();
+    mmu.map_memory_len(0x0, 0x1000, Mapping { perm: perm::READ | perm::WRITE | perm::EXEC, value: 0 });
+    // A host image load marks the bytes INIT (as `fast_core_write_mem` does),
+    // then fetching marks them executed.
+    mmu.write_bytes(0x0, &[0x00, 0x00, 0x00, 0x00], perm::NONE).unwrap();
+    assert!(mmu.ensure_executable(0x0, 4));
+    assert!(mmu.code_writes.is_empty());
+
+    // Default (auto-invalidate): the store lands and the range is recorded.
+    mmu.write_bytes(0x0, &[0x01, 0x02, 0x03, 0x04], perm::NONE).unwrap();
+    assert_eq!(
+        mmu.code_writes,
+        vec![(0x0, 0x1), (0x1, 0x2), (0x2, 0x3), (0x3, 0x4)],
+        "each byte-store over executed code is recorded for invalidation"
+    );
+    mmu.code_writes.clear();
+
+    // The `IN_CODE_CACHE` marker is gone over the written bytes: a second
+    // store to the same bytes records no new code write and lands normally.
+    mmu.write_bytes(0x0, &[0x05, 0x06, 0x07, 0x08], perm::NONE).unwrap();
+    assert!(mmu.code_writes.is_empty(), "no record once the marker is cleared");
+    let mut out = [0u8; 4];
+    mmu.read_bytes(0x0, &mut out, perm::NONE).unwrap();
+    assert_eq!(out, [0x05, 0x06, 0x07, 0x08]);
+
+    // Strict diagnostic mode refuses the store into executed code instead.
+    let mut strict = Mmu::default();
+    strict.detect_self_modifying_code = true;
+    strict.map_memory_len(0x0, 0x1000, Mapping { perm: perm::READ | perm::WRITE | perm::EXEC, value: 0 });
+    strict.write_bytes(0x0, &[0x00, 0x00, 0x00, 0x00], perm::NONE).unwrap();
+    assert!(strict.ensure_executable(0x0, 4));
+    assert_eq!(
+        strict.write_bytes(0x0, &[0x01, 0x02, 0x03, 0x04], perm::NONE),
+        Err(MemError::SelfModifyingCode),
+        "strict mode keeps the refusal"
+    );
+    assert!(strict.code_writes.is_empty());
+}
+
+#[test]
 fn write_across_boundary() {
     let mut mmu = Mmu::default();
     mmu.map_memory_len(0x20000, 0x2000, Mapping { perm: perm::NONE, value: 0xAA });

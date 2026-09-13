@@ -193,3 +193,77 @@ fn default_backend_is_jit() {
     let vm = crate::build(&Config::from_target_triple("x86_64-none")).unwrap();
     assert_eq!(vm.backend, crate::Backend::Jit);
 }
+
+/// A guest store over executed code must invalidate the stale translations,
+/// not be refused: the next fetch re-lifts from the new bytes. This pins the
+/// record-and-proceed SMC path (the emulation contract) and the VM's drain of
+/// `code_writes` on the serving paths.
+#[test]
+fn store_over_executed_code_re_lifts() {
+    let mut vm = crate::build(&Config {
+        triple: "riscv64-none".parse().unwrap(),
+        enable_jit: false,
+        ..Config::default()
+    })
+    .unwrap();
+    vm.cpu.mem.map_memory_len(0x1000, 0x1000, Mapping { perm: perm::READ | perm::WRITE | perm::EXEC, value: 0 });
+
+    // An infinite loop at 0x1000: `j 0x1000` (jal x0, 0).
+    let loopinst: [u8; 4] = [0x6f, 0x00, 0x00, 0x00];
+    vm.cpu.mem.write_bytes(0x1000, &loopinst, perm::NONE).unwrap();
+
+    // Executing the loop marks the page executed and lifts the block. With
+    // `enable_jit: false` the interpreter serves the lifted block; `step(2)`
+    // executes the loop twice (its one instruction) and hits the limit.
+    vm.cpu.write_pc(0x1000);
+    assert_eq!(vm.step(2), VmExit::InstructionLimit);
+    assert!(vm.cpu.mem.code_writes.is_empty(), "no code writes yet");
+    assert!(!vm.code.map.is_empty(), "the loop block is lifted");
+
+    // A guest store over the executed loop, as a stage loader would do. The
+    // write must land and be recorded for invalidation.
+    let nop: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
+    vm.cpu.mem.write_bytes(0x1000, &nop, perm::NONE).unwrap();
+    // `write_bytes` decomposes into single-byte stores; only the first byte
+    // differs from the executed image (0x6f -> 0x13), so exactly that byte is
+    // recorded for invalidation.
+    assert_eq!(vm.cpu.mem.code_writes, vec![(0x1000, 0x1001)]);
+
+    // The next run drains the invalidation, drops the stale block and
+    // re-lifts from the new bytes: the old `j 0x1000` loop is gone, so the
+    // replacement nop executes once and the pc advances past it.
+    vm.cpu.write_pc(0x1000);
+    assert_eq!(vm.step(1), VmExit::InstructionLimit);
+    assert!(vm.cpu.mem.code_writes.is_empty(), "drained on the serving path");
+    assert_eq!(vm.cpu.read_pc(), 0x1004, "re-lifted from the new bytes");
+}
+
+/// The JIT serving path mut be covered too: `jit.lookup_fast` and
+/// `entry_points` survive the block-map drop, so `flush_code_writes` must
+/// invalidate them (via `jit.invalidate`) as well.
+#[test]
+fn store_over_executed_code_re_lifts_jit() {
+    let mut vm = crate::build(&Config {
+        triple: "riscv64-none".parse().unwrap(),
+        enable_jit: true,
+        ..Config::default()
+    })
+    .unwrap();
+    vm.cpu.mem.map_memory_len(0x1000, 0x1000, Mapping { perm: perm::READ | perm::WRITE | perm::EXEC, value: 0 });
+
+    let loopinst: [u8; 4] = [0x6f, 0x00, 0x00, 0x00]; // j 0x1000
+    vm.cpu.mem.write_bytes(0x1000, &loopinst, perm::NONE).unwrap();
+
+    vm.cpu.write_pc(0x1000);
+    assert_eq!(vm.step(2), VmExit::InstructionLimit);
+    assert!(!vm.code.map.is_empty(), "the loop block is lifted");
+
+    let nop: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
+    vm.cpu.mem.write_bytes(0x1000, &nop, perm::NONE).unwrap();
+    assert!(!vm.cpu.mem.code_writes.is_empty(), "store recorded");
+
+    vm.cpu.write_pc(0x1000);
+    assert_eq!(vm.step(1), VmExit::InstructionLimit);
+    assert!(vm.cpu.mem.code_writes.is_empty(), "drained on the serving path");
+    assert_eq!(vm.cpu.read_pc(), 0x1004, "re-lifted from the new bytes");
+}
